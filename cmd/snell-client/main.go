@@ -74,13 +74,16 @@ func loadClientConfig(path string) (clientFileConfig, error) {
 	out := clientFileConfig{
 		listen: sec.Key("listen").MustString("127.0.0.1:1080"),
 		snellCfg: snell.ClientConfig{
-			Server:   sec.Key("server").MustString(""),
-			PSK:      sec.Key("psk").MustString(""),
-			ObfsMode: sec.Key("obfs").MustString("off"),
-			ObfsHost: sec.Key("obfs-host").MustString(""),
-			Reuse:    sec.Key("reuse").MustBool(false),
-			Version:  sec.Key("version").MustString(""),
-			TFO:      sec.Key("tfo").MustBool(false),
+			Server:         sec.Key("server").MustString(""),
+			PSK:            sec.Key("psk").MustString(""),
+			ObfsMode:       sec.Key("obfs").MustString("off"),
+			ObfsHost:       sec.Key("obfs-host").MustString(""),
+			Reuse:          sec.Key("reuse").MustBool(false),
+			Version:        sec.Key("version").MustString(""),
+			TFO:            sec.Key("tfo").MustBool(false),
+			Brutal:         sec.Key("brutal").MustBool(false),
+			BrutalMbps:     sec.Key("brutal-mbps").MustInt(0),
+			BrutalCwndGain: sec.Key("brutal-cwnd-gain").MustInt(0),
 		},
 	}
 	return out, nil

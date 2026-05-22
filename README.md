@@ -1,6 +1,14 @@
-# OpenSnell
+# OpenSnell (alpha branch)
 
 English | [简体中文](README_zh.md)
+
+> **You are reading the `alpha` branch README.** This branch tracks
+> [`main`](https://github.com/missuo/opensnell/tree/main) and layers
+> experimental features that the official Surge `snell-server` does NOT
+> ship — right now that means `tcp-brutal` congestion control. If you only
+> need Surge-compatible behavior, use the `main` branch and its tagged
+> releases. Use the `alpha` branch if you specifically want the extra
+> features documented here.
 
 A Go implementation of the Snell proxy protocol, versions **4** and **5** —
 server-side and client-side, with **end-to-end interoperability against the
@@ -9,12 +17,6 @@ official Surge `snell-server v5.0.1`** verified for every code path below.
 Snell v5's UDP/QUIC proxy mode is supported on the **server** only; pair it
 with the **Surge** client (or any other v5-capable client) when you need
 HTTP/3 acceleration for downstream applications.
-
-> **Looking for features the official Surge `snell-server` does not have?**
-> The [`alpha`](https://github.com/missuo/opensnell/tree/alpha) branch tracks
-> `main` and layers experimental, non-Surge-standard extensions on top —
-> currently `tcp-brutal` congestion control. `main` stays interop-pure with
-> the official server; `alpha` is where we add features Surge doesn't ship.
 
 ### Why no v1 / v2 / v3?
 
@@ -42,6 +44,7 @@ the current Surge `snell-server` speaks.
 | Custom upstream DNS (`dns = …`)       | ✅             | —              |
 | TCP Fast Open (Linux only)            | ✅             | ✅             |
 | **QUIC proxy mode (v5)**              | ✅             | use Surge      |
+| **`tcp-brutal` CC (experimental, Linux only)** | ✅    | ✅             |
 
 ## Install
 
@@ -150,6 +153,21 @@ dns =
 ; set for server (run `sysctl -w net.ipv4.tcp_fastopen=3`). On other
 ; platforms this option is a silent no-op.
 tfo = false
+
+; --- EXPERIMENTAL: tcp-brutal congestion control ---
+; Switches every accepted TCP connection from a snell client onto the
+; apernet/tcp-brutal kernel CC algorithm and pins it to `brutal-mbps`.
+; Linux only; requires `apt install linux-headers-$(uname -r) && cd
+; tcp-brutal && make && make load` first. If the kernel module is
+; missing the server just logs a warning and falls back to default CC.
+;
+; ⚠️  WARNING: brutal applies its rate PER TCP CONNECTION. Snell has no
+; native mux, so multiple concurrent SOCKS5 sessions each get the full
+; rate and will overwhelm the receiver. Only safe for single-stream
+; workloads, or paired with `reuse = true` and known-low concurrency.
+brutal = false
+brutal-mbps = 100         ; required when brutal = true; per-conn rate in Mbit/s
+brutal-cwnd-gain = 15     ; optional; tenths (15 = 1.5x, 20 = 2.0x)
 ```
 
 Run:
@@ -224,6 +242,16 @@ reuse = true
 ; default false. Linux only — see the server-side `tfo` notes above
 ; for the kernel sysctl requirements.
 tfo = false
+
+; --- EXPERIMENTAL: tcp-brutal congestion control on outbound ---
+; Switches every TCP connection to the snell server onto the brutal CC
+; algorithm. Linux only; this only controls the CLIENT→SERVER
+; (upload) direction — for download-side acceleration set the same
+; option on the server. Same multiplexing caveat as the server-side
+; option applies. Off by default.
+brutal = false
+brutal-mbps = 100         ; required when brutal = true; per-conn upload rate
+brutal-cwnd-gain = 15     ; optional; tenths
 ```
 
 Run:
@@ -409,6 +437,63 @@ and is **indistinguishable in latency**. The bufio fix is `+9/−1`
 lines in `components/snell/v4.go` — a useful reminder that profiling
 the read path (and not just application logic) is where most of the
 gap to a native C/libuv implementation lives.
+
+## Experimental: tcp-brutal congestion control
+
+[apernet/tcp-brutal](https://github.com/apernet/tcp-brutal) is a Linux
+kernel module that exposes a `brutal` TCP congestion-control algorithm.
+Userspace sets a fixed per-socket sending rate; the kernel paces the
+socket to that rate without listening to loss feedback. Useful on
+high-loss long-fat paths where cubic/bbr collapse.
+
+How to use with OpenSnell:
+
+```sh
+# On the server host (Linux):
+apt install linux-headers-$(uname -r) make gcc
+git clone https://github.com/apernet/tcp-brutal /tmp/tcp-brutal
+cd /tmp/tcp-brutal && make && insmod brutal.ko
+# Verify it loaded:
+cat /proc/sys/net/ipv4/tcp_available_congestion_control   # should now include "brutal"
+```
+
+Then set `brutal = true` and `brutal-mbps = <Mbps>` in
+`snell-server.conf` (and/or `snell-client.conf`). Restart and the
+relevant direction will be rate-pinned per connection.
+
+**Verified end-to-end** on a v6-capable Linux server (`brutal-mbps = 50`,
+100 MB download via `cachefly.cachefly.net/100mb.test`):
+
+| Server CC      | Time   | Speed     |
+| -------------- | ------ | --------- |
+| vanilla (cubic)| 1.89 s | 444 Mbps  |
+| brutal (50)    | 16.97 s| **49.4 Mbps**(< 2 % off the configured 50)|
+
+### ⚠️ Read this before turning brutal on
+
+Quoting the upstream maintainers verbatim:
+
+> "Brutal's rate setting **applies to each individual connection**.
+> This makes it suitable only for protocols that support multiplexing
+> (mux). For protocols that require a separate connection for each
+> proxy connection, using TCP Brutal will **overwhelm the receiver**
+> if multiple connections are active at the same time."
+
+Snell does **not** support mux. Reuse-mode (`CommandConnectV2`) is
+*serial* — one CONNECT per TCP at a time — and the client may still
+hold multiple pooled TCPs concurrently. **If your workload opens N
+parallel snell connections, your server tries to push N × `brutal-mbps`
+total** and the receiver may collapse with packet loss. Use this only
+when:
+
+- You have a sustained single-stream workload (large file download,
+  video stream, etc.), OR
+- You're testing.
+
+Either side can enable brutal independently. Server-only enable
+controls server → client (downloads — the typical proxy traffic);
+client-only enable controls client → server (uploads). They don't
+need to match.
 
 ## Interop with the real Surge `snell-server`
 

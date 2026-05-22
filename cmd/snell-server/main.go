@@ -81,6 +81,9 @@ func loadServerConfig(path string) (snell.ServerConfig, error) {
 		IPv6:            sec.Key("ipv6").MustBool(true),
 		TFO:             sec.Key("tfo").MustBool(false),
 		DNS:             parseDNSList(sec.Key("dns").MustString("")),
+		Brutal:          sec.Key("brutal").MustBool(false),
+		BrutalMbps:      sec.Key("brutal-mbps").MustInt(0),
+		BrutalCwndGain:  sec.Key("brutal-cwnd-gain").MustInt(0),
 	}
 	return cfg, nil
 }

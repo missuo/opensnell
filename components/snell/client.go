@@ -49,6 +49,20 @@ type ClientConfig struct {
 	// Linux only (uses TCP_FASTOPEN_CONNECT setsockopt). On other
 	// platforms the option is silently no-op. Off by default.
 	TFO bool
+
+	// Brutal enables apernet/tcp-brutal congestion control on outbound
+	// TCP connections to the snell server. EXPERIMENTAL: requires the
+	// brutal kernel module loaded on Linux. The rate controls the
+	// CLIENT→SERVER direction (uploads); for download-side acceleration
+	// configure the same option on the server. Off by default.
+	Brutal bool
+
+	// BrutalMbps is the per-connection upstream rate (Mbit/s) applied
+	// when Brutal is enabled. Must be > 0 if Brutal is true.
+	BrutalMbps int
+
+	// BrutalCwndGain is the cwnd-gain in tenths. Optional, default 15.
+	BrutalCwndGain int
 }
 
 func (c ClientConfig) normalizedVersion() string {
@@ -111,6 +125,21 @@ func NewClient(cfg ClientConfig, logger *slog.Logger) (*Client, error) {
 			logger.Info("tcp fast open enabled (outbound dialer)")
 		}
 	}
+	if cfg.Brutal {
+		if cfg.BrutalMbps <= 0 {
+			return nil, errors.New("brutal: brutal-mbps must be > 0 when brutal is enabled")
+		}
+		if cfg.BrutalCwndGain <= 0 {
+			cfg.BrutalCwndGain = 15
+		}
+		if !brutalSupported() {
+			logger.Warn("tcp-brutal requested but only supported on Linux; setting will be ignored",
+				"mbps", cfg.BrutalMbps)
+		} else {
+			logger.Info("tcp-brutal enabled on client outbound (EXPERIMENTAL)",
+				"mbps", cfg.BrutalMbps, "cwnd_gain", cfg.BrutalCwndGain)
+		}
+	}
 	logger.Info("snell client",
 		"server", cfg.Server,
 		"version", cfg.normalizedVersion(),
@@ -123,6 +152,18 @@ func NewClient(cfg ClientConfig, logger *slog.Logger) (*Client, error) {
 		c.pool = NewPool(c.dialFresh)
 	}
 	return c, nil
+}
+
+// maybeApplyBrutal applies tcp-brutal CC to a fresh outbound TCP conn
+// when enabled in the client config. Logged-but-non-fatal on failure.
+func (c *Client) maybeApplyBrutal(conn net.Conn) {
+	if !c.cfg.Brutal || !brutalSupported() {
+		return
+	}
+	rate := uint64(c.cfg.BrutalMbps) * 1_000_000 / 8
+	if err := applyBrutal(conn, rate, uint32(c.cfg.BrutalCwndGain)); err != nil {
+		c.logger.Warn("tcp-brutal setsockopt failed; continuing with default CC", "err", err)
+	}
 }
 
 // dialFresh opens a new TCP+obfs+snell connection to the server, with no
@@ -139,6 +180,7 @@ func (c *Client) dialFresh(ctx context.Context) (*Snell, error) {
 	if tc, ok := raw.(*net.TCPConn); ok {
 		_ = tc.SetKeepAlive(true)
 	}
+	c.maybeApplyBrutal(raw)
 	obfsConn, err := obfs.NewObfsClient(raw, c.cfg.ObfsHost, c.port, c.cfg.ObfsMode)
 	if err != nil {
 		_ = raw.Close()

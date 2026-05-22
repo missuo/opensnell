@@ -92,6 +92,22 @@ type ServerConfig struct {
 	// added in v4.1.0. Equivalent log line at startup is "effective
 	// DNS: <addr>" for each configured server.
 	DNS []string
+
+	// Brutal enables apernet/tcp-brutal congestion control on every
+	// accepted TCP connection from a snell client. EXPERIMENTAL:
+	// requires the brutal kernel module loaded on Linux. The rate is
+	// applied PER CONNECTION; snell has no native multiplexing, so this
+	// is only safe when you trust there is at most one heavy concurrent
+	// stream at a time. Off by default.
+	Brutal bool
+
+	// BrutalMbps is the per-connection downstream rate (Mbit/s) applied
+	// when Brutal is enabled. Must be > 0 if Brutal is true.
+	BrutalMbps int
+
+	// BrutalCwndGain is the cwnd-gain in tenths (15 = 1.5x, 20 = 2.0x).
+	// Optional, default 15 (matches the brutal example).
+	BrutalCwndGain int
 }
 
 // Server is a snell v4/v5 server. Use NewServer + Serve, or pass an
@@ -196,6 +212,22 @@ func NewServer(cfg ServerConfig, logger *slog.Logger) (*Server, error) {
 			}
 		}
 	}
+	if cfg.Brutal {
+		if cfg.BrutalMbps <= 0 {
+			return nil, errors.New("brutal: brutal-mbps must be > 0 when brutal is enabled")
+		}
+		if cfg.BrutalCwndGain <= 0 {
+			cfg.BrutalCwndGain = 15
+		}
+		if !brutalSupported() {
+			logger.Warn("tcp-brutal requested but only supported on Linux; setting will be ignored",
+				"mbps", cfg.BrutalMbps)
+		} else {
+			logger.Info("tcp-brutal enabled (EXPERIMENTAL)",
+				"mbps", cfg.BrutalMbps, "cwnd_gain", cfg.BrutalCwndGain)
+		}
+		s.cfg = cfg
+	}
 	return s, nil
 }
 
@@ -218,6 +250,21 @@ func chainListenControl(fns ...func(string, string, syscall.RawConn) error) func
 			}
 		}
 		return nil
+	}
+}
+
+// maybeApplyBrutal applies tcp-brutal congestion control to conn when
+// enabled in the server config. Logged-but-non-fatal on failure (the
+// kernel module may not be installed; we prefer working-with-default-CC
+// over refusing to serve the request).
+func (s *Server) maybeApplyBrutal(conn net.Conn) {
+	if !s.cfg.Brutal || !brutalSupported() {
+		return
+	}
+	rate := uint64(s.cfg.BrutalMbps) * 1_000_000 / 8 // Mbit/s → bytes/s
+	if err := applyBrutal(conn, rate, uint32(s.cfg.BrutalCwndGain)); err != nil {
+		s.logger.Warn("tcp-brutal setsockopt failed; continuing with default CC",
+			"remote", conn.RemoteAddr().String(), "err", err)
 	}
 }
 
@@ -325,6 +372,7 @@ func (s *Server) ServeListener(ctx context.Context, ln net.Listener) error {
 		if tc, ok := conn.(*net.TCPConn); ok {
 			_ = tc.SetKeepAlive(true)
 		}
+		s.maybeApplyBrutal(conn)
 		go s.handleConn(ctx, conn)
 	}
 }
