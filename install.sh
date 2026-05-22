@@ -46,9 +46,23 @@ SERVICE_NAME="snell-server"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
 OPENSNELL_REPO="missuo/opensnell"
-OPENSNELL_RELEASE_API="https://api.github.com/repos/${OPENSNELL_REPO}/releases/latest"
+# CHANNEL = stable | alpha. Stable is the default; alpha pulls from the
+# rolling `alpha` tag that the alpha-branch CI publishes on every push.
+# The channel is set from a top-level `--alpha` script flag (parsed in
+# main) and persisted to the install meta file so subsequent `update`
+# runs stay on the same channel without needing the flag again.
+CHANNEL="stable"
+OPENSNELL_RELEASE_API_STABLE="https://api.github.com/repos/${OPENSNELL_REPO}/releases/latest"
+OPENSNELL_RELEASE_API_ALPHA="https://api.github.com/repos/${OPENSNELL_REPO}/releases/tags/alpha"
 SURGE_VERSION="v5.0.1"
 SURGE_BASE_URL="https://dl.nssurge.com/snell"
+
+opensnell_release_api() {
+    case "$CHANNEL" in
+        alpha) echo "$OPENSNELL_RELEASE_API_ALPHA" ;;
+        *)     echo "$OPENSNELL_RELEASE_API_STABLE" ;;
+    esac
+}
 
 # ============================================================================
 # Preflight
@@ -256,6 +270,10 @@ get_install_variant() {
     [ -f "$META_FILE" ] && grep '^variant=' "$META_FILE" | cut -d= -f2 || true
 }
 
+get_install_channel() {
+    [ -f "$META_FILE" ] && grep '^channel=' "$META_FILE" | cut -d= -f2 || true
+}
+
 prompt_default() {
     # prompt_default "Question" "default" -> echoes user input or default
     local question="$1" default="$2" reply
@@ -281,11 +299,18 @@ prompt_yesno() {
 download_opensnell() {
     print_header "Downloading OpenSnell"
     mkdir -p "$CONFIG_DIR"
-    local arch tag url
+    local arch tag url api channel_label
     arch=$(detect_arch_opensnell)
-    tag=$(curl -fsSL "$OPENSNELL_RELEASE_API" | grep '"tag_name":' | head -1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
+    api=$(opensnell_release_api)
+    tag=$(curl -fsSL "$api" | grep '"tag_name":' | head -1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
     if [ -z "$tag" ]; then
-        print_error "Could not resolve latest release from GitHub API."
+        if [ "$CHANNEL" = "alpha" ]; then
+            print_error "Could not resolve the rolling 'alpha' release from GitHub API."
+            print_info "The alpha branch CI may not have produced an alpha release yet — check:"
+            print_info "    https://github.com/${OPENSNELL_REPO}/releases/tag/alpha"
+        else
+            print_error "Could not resolve latest release from GitHub API."
+        fi
         print_info "Build from source instead: go install github.com/${OPENSNELL_REPO}/cmd/snell-server@latest"
         exit 1
     fi
@@ -294,7 +319,12 @@ download_opensnell() {
     # consume those here (this installer is Linux-only by design).
     url="https://github.com/${OPENSNELL_REPO}/releases/download/${tag}/snell-server-linux-${arch}"
 
-    print_info "Variant:      OpenSnell (self-hosted, GPLv3)"
+    if [ "$CHANNEL" = "alpha" ]; then
+        channel_label="OpenSnell (alpha channel — rolling pre-release)"
+    else
+        channel_label="OpenSnell (self-hosted, GPLv3)"
+    fi
+    print_info "Variant:      ${channel_label}"
     print_info "Architecture: linux/${arch}"
     print_info "Version:      ${tag}"
     print_info "Source:       ${url}"
@@ -319,6 +349,7 @@ download_opensnell() {
 
     echo "variant=opensnell" >  "$META_FILE.tmp"
     echo "version=$tag"      >> "$META_FILE.tmp"
+    echo "channel=$CHANNEL"  >> "$META_FILE.tmp"
 }
 
 download_surge() {
@@ -531,9 +562,10 @@ show_info() {
         print_warning "No installation metadata found; is the server installed?"
         return 1
     fi
-    local variant version port psk obfs ipv6 tfo node_name geo_ip ip
+    local variant version channel port psk obfs ipv6 tfo node_name geo_ip ip
     variant=$(grep   '^variant='     "$META_FILE" | cut -d= -f2-)
     version=$(grep   '^version='     "$META_FILE" | cut -d= -f2-)
+    channel=$(grep   '^channel='     "$META_FILE" | cut -d= -f2-)
     port=$(grep      '^port='        "$META_FILE" | cut -d= -f2-)
     psk=$(grep       '^psk='         "$META_FILE" | cut -d= -f2-)
     obfs=$(grep      '^obfs='        "$META_FILE" | cut -d= -f2-)
@@ -541,6 +573,7 @@ show_info() {
     tfo=$(grep       '^tfo='         "$META_FILE" | cut -d= -f2-)
     node_name=$(grep '^node_name='   "$META_FILE" | cut -d= -f2-)
     geo_ip=$(grep    '^geo_ip='      "$META_FILE" | cut -d= -f2-)
+    [ -z "$channel" ] && channel="stable"
 
     # Prefer the IP we resolved at install time; if that wasn't captured
     # (e.g. ip.sb was down then), try again now, and last-ditch fall back
@@ -561,6 +594,9 @@ show_info() {
     print_header "Connection Info"
     echo -e "${BOLD}Node name:${NC}    ${node_name}"
     echo -e "${BOLD}Variant:${NC}      ${variant} (${version})"
+    if [ "$variant" = "opensnell" ]; then
+        echo -e "${BOLD}Channel:${NC}      ${channel}"
+    fi
     echo -e "${BOLD}Server IP:${NC}    ${ip}"
     echo -e "${BOLD}Port:${NC}         ${port}"
     echo -e "${BOLD}PSK:${NC}          ${psk}"
@@ -628,16 +664,38 @@ do_update() {
     check_root; ensure_tools
     local variant; variant=$(get_install_variant)
     [ -z "$variant" ] && variant="opensnell"
-    print_info "Updating variant: $variant"
+
+    # Honor the previously-installed channel unless the user explicitly
+    # passed --alpha on this invocation. So `update` after `install --alpha`
+    # keeps fetching alpha without needing the flag again.
+    if [ "$CHANNEL" = "stable" ]; then
+        local persisted_channel
+        persisted_channel=$(get_install_channel)
+        if [ -n "$persisted_channel" ]; then
+            CHANNEL="$persisted_channel"
+        fi
+    fi
+
+    print_info "Updating variant: $variant (channel: $CHANNEL)"
     if [ "$variant" = "surge" ]; then
         download_surge
     else
         download_opensnell
     fi
-    # Merge variant/version from .tmp into existing meta
+    # Merge variant/version/channel from .tmp into existing meta. We
+    # rewrite version + channel in place; variant is already correct.
     if [ -f "$META_FILE.tmp" ]; then
-        local newver; newver=$(grep '^version=' "$META_FILE.tmp" | cut -d= -f2)
+        local newver newchan
+        newver=$(grep '^version=' "$META_FILE.tmp" | cut -d= -f2)
+        newchan=$(grep '^channel=' "$META_FILE.tmp" | cut -d= -f2)
         sed -i.bak "s/^version=.*/version=${newver}/" "$META_FILE" 2>/dev/null || true
+        if [ -n "$newchan" ]; then
+            if grep -q '^channel=' "$META_FILE" 2>/dev/null; then
+                sed -i.bak "s/^channel=.*/channel=${newchan}/" "$META_FILE"
+            else
+                echo "channel=${newchan}" >> "$META_FILE"
+            fi
+        fi
         rm -f "$META_FILE.tmp" "$META_FILE.bak"
     fi
     restart_service
@@ -672,7 +730,7 @@ show_help() {
     cat <<EOF
 OpenSnell server installer
 
-Usage: $0 <subcommand>
+Usage: $0 [--alpha] <subcommand>
 
 Subcommands:
   install        Interactive install (default action when run without args)
@@ -682,6 +740,16 @@ Subcommands:
   start | stop | restart | enable | disable | status
   info           Print server IP / port / PSK / Surge config snippet
   help           Show this help
+
+Channel flags (apply to install / update of the OpenSnell variant only;
+the Surge variant has only one official build):
+
+  --alpha        Pull from the rolling "alpha" GitHub release instead of
+                 the latest stable tag. Useful for trying experimental
+                 features ahead of release. The channel is persisted to
+                 /etc/snell/.install_meta so future updates stay on the
+                 same channel without re-passing the flag. To leave the
+                 alpha channel, run \`install\` (without --alpha) again.
 
 Interactive menu is shown when no subcommand is given.
 EOF
@@ -724,12 +792,24 @@ show_menu() {
 }
 
 main() {
+    # Parse global flags (currently only --alpha). They can appear in any
+    # order relative to the subcommand. We rebuild positional args without
+    # the consumed flag(s) so the subcommand dispatcher below sees a clean
+    # arg list.
+    local positional=()
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --alpha)        CHANNEL="alpha";    shift ;;
+            --stable)       CHANNEL="stable";   shift ;;
+            help|--help|-h) show_help; return ;;
+            *)              positional+=("$1"); shift ;;
+        esac
+    done
+    set -- "${positional[@]+"${positional[@]}"}"
+
     # `help` is the only subcommand that should work anywhere; everything
     # else needs systemd / iptables / sysctl etc., so refuse non-Linux
     # immediately rather than fail halfway through.
-    case "${1:-}" in
-        help|--help|-h) show_help; return ;;
-    esac
     check_linux
 
     case "${1:-}" in

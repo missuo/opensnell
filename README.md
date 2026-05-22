@@ -67,6 +67,28 @@ The interactive installer:
 - Re-run with `reconfigure`, `update`, `uninstall`, `start`, `stop`,
   `restart`, `status`, or `info` — see `./install.sh help`.
 
+#### Installing the alpha channel
+
+The `alpha` branch tracks experimental features ahead of stable
+release (currently: TUN inbound, fake-IP DNS, tcp-brutal CC, custom
+upstream DNS — none of which the official Surge `snell-server`
+ships). CI publishes a rolling pre-release tagged `alpha` on every
+push to that branch; the installer can pull from it via `--alpha`:
+
+```sh
+bash <(curl -fsSL https://s.ee/opensnell) install --alpha
+```
+
+The channel is persisted to `/etc/snell/.install_meta`, so subsequent
+`update` runs stay on alpha without re-passing the flag. To switch
+back to the stable channel, run `install` again **without** the flag.
+
+Alpha builds carry the same on-the-wire compatibility guarantees as
+stable (full interop with Surge `snell-server v5.0.1` is part of CI),
+but the extra features above are not yet part of the official Snell
+spec and may be removed or reshaped without warning. Use on
+production systems at your own risk.
+
 ### Build from source
 
 ```sh

@@ -2,7 +2,7 @@ name: Build
 
 on:
   push:
-    branches: [main]
+    branches: [main, alpha]
     tags: ['v*']
     paths:
       - '**/*.go'
@@ -12,7 +12,7 @@ on:
       - 'go.work.sum'
       - '.github/workflows/build.yml'
   pull_request:
-    branches: [main]
+    branches: [main, alpha]
     paths:
       - '**/*.go'
       - 'go.mod'
@@ -63,6 +63,8 @@ jobs:
         run: |
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          elif [[ "${GITHUB_REF}" == "refs/heads/alpha" ]]; then
+            echo "version=alpha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
           else
             echo "version=dev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
           fi
@@ -96,8 +98,13 @@ jobs:
       - run: go vet ./...
       - run: go test -race ./...
 
+  # Stable / tagged release. Runs on any push of a `v*` tag, whether the
+  # tag itself is annotated as alpha (e.g. `v1.0.3-alpha.1`) or not — the
+  # pre-release flag is set automatically when the tag name carries a
+  # `-alpha` / `-beta` / `-rc` qualifier so GitHub doesn't promote it to
+  # "Latest".
   release:
-    name: Release
+    name: Release (tag)
     needs: [build, test]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
@@ -116,4 +123,50 @@ jobs:
             artifacts/snell-server-*
             artifacts/snell-client-*
           generate_release_notes: true
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}
+
+  # Rolling alpha release. Triggered by every push to the `alpha` branch
+  # (the path filter on the workflow trigger means README-only pushes are
+  # skipped). Publishes into a fixed tag `alpha`, marked as a prerelease
+  # with `make_latest: false` so it doesn't displace the stable release
+  # in the "Latest" slot on GitHub. Each push overwrites the binaries on
+  # the same tag; installers can fetch them by hitting
+  # `/releases/tags/alpha` instead of `/releases/latest`.
+  release-alpha:
+    name: Release (alpha rolling)
+    needs: [build, test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/alpha'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: alpha
+          name: "Alpha (rolling build of the alpha branch)"
+          body: |
+            **Rolling pre-release.** This release tracks the tip of the
+            `alpha` branch and is overwritten on every push. For the
+            stable channel see the [latest tagged release](../../releases/latest).
+
+            Built from `${{ github.sha }}` at ${{ github.run_id }}.
+
+            Install via the one-line installer's `--alpha` flag:
+
+            ```
+            bash <(curl -fsSL https://s.ee/opensnell) install --alpha
+            ```
+          files: |
+            artifacts/snell-server-*
+            artifacts/snell-client-*
+          prerelease: true
+          make_latest: false
+          target_commitish: ${{ github.sha }}
           fail_on_unmatched_files: true
