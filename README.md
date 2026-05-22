@@ -262,34 +262,68 @@ Run:
 ./snell-client -c snell-client.conf -v    # debug level logs
 ```
 
-### EXPERIMENTAL: TUN inbound — transparent TCP capture (Linux only)
+### EXPERIMENTAL: TUN inbound — transparent TCP capture with fake-IP DNS (Linux only)
 
 In addition to the SOCKS5 listener, `snell-client` can transparently
 capture **every new outbound TCP connection** on the machine and tunnel
-it through the snell server — no SOCKS5 awareness required from the app
-side.
+it through the snell server — no SOCKS5 awareness required from the
+app side, and **with the original hostname preserved end-to-end** so
+the snell server does its own (clean) DNS resolution.
 
-The mechanism is **nftables-based REDIRECT** (sing-tun's "auto-redirect"
-mode), not a default-route hijack. This matters: an `ip rule` style
-hijack would also break the host's own services because the kernel can't
-tell "reply to an inbound connection" from "new outbound from a local
-process" in the FIB layer. Letting nftables + conntrack do the
-classification gives us the right semantics for free:
+The mechanism is **fake-IP DNS hijack + nftables REDIRECT**, the same
+architecture clash / mihomo / sing-box use:
+
+```
+                   ┌──────────────────────────────────────────────────┐
+   App  ─DNS Q──►  │ sing-tun DNATs UDP 53 to TUN gateway (198.18.128.1) │
+                   └────────────────┬─────────────────────────────────┘
+                                    ▼
+                snell-client's local fake-IP DNS server
+                                    │   (allocates 198.18.128.42 ⇄ "registry-1.docker.io")
+                                    ▼  (returns A 198.18.128.42)
+
+   App ─TCP 443 to 198.18.128.42──► kernel routes via TUN (snell0)
+                                                  │
+                                                  ▼
+                          sing-tun userspace "system" stack
+                                                  │
+                                                  ▼ reverse-lookup pool: 198.18.128.42 → name
+                                                  
+                snell.Client.DialTCP("registry-1.docker.io", 443)   ← AtypDomainName!
+                                                  │
+                                                  ▼
+                  snell server uses its own resolver, gets the real IP
+```
+
+Why the fake-IP layer matters: many users live behind ISP DNS that
+**poisons** docker.io, github.com, googlevideo.com etc. — if the local
+host resolves and only an IP reaches the snell server, the IP is
+already wrong and snell can do nothing about it. With fake-IP, the
+snell server itself does the resolution from its presumably uncontaminated
+upstream (and you can pin that upstream via the server's `dns = …`).
+
+The same binary also installs sing-tun's nftables auto-redirect for
+real-IP destinations (apps that connect to literal IPs, not hostnames).
+Both inbound paths share one handler. Because the rules use conntrack,
+the host's own services are left strictly alone:
 
 | Traffic                                              | Behavior |
 | ---------------------------------------------------- | -------- |
 | Inbound TCP/UDP to local services (sshd, nginx, caddy, realm, …) | **Unchanged** — `PREROUTING` excludes local destinations |
 | Reply packets from those services back to the client | **Unchanged** — `ct mark` on the conntrack entry bypasses redirect |
-| New outbound TCP from local processes                | **Redirected** → snell server |
+| New outbound TCP from local processes (by hostname)  | **Redirected via fake-IP** → snell server with `AtypDomainName` |
+| New outbound TCP from local processes (literal IP)   | **Redirected via REDIRECT** → snell server with `AtypIPv4` |
 | `snell-client`'s own connection to the snell server  | **Unchanged** — `SO_MARK` 0x2024 is matched in OUTPUT and returns early |
-| UDP / ICMP from local processes                      | **Unchanged** — v1 is TCP-only |
+| UDP from local processes (other than DNS)            | **Unchanged** — v2 captures DNS only, other UDP stays direct |
+| ICMP from local processes                            | **Unchanged** |
 | `FORWARD`-chain routed traffic (containers, `ip_forward=1`) | **Unchanged** — we don't touch FORWARD |
 
 This means new SSH sessions from any source can still connect, existing
-TCP services on the box keep working, and a reboot or process restart of
-`snell-client` leaves the host in the same state as before (the
-nftables table and a single `ip rule` priority 1 entry are torn down
-in the `Inbound.Close()` path on `SIGTERM` / `SIGINT`).
+TCP services on the box keep working, and a `SIGTERM`/`SIGINT` to
+`snell-client` removes the TUN interface, the nftables table, and the
+one `ip rule` priority-1 entry sing-tun installs — leaving the host
+exactly as it was before. Verified end-to-end including `docker pull`
+of Docker Hub official images on a box with poisoned ISP DNS.
 
 Requirements:
 
@@ -325,14 +359,23 @@ Add a `[snell-tun]` section alongside the existing `[snell-client]`:
 ; on with the --tun command-line flag.
 enable = true
 
+; TUN interface name. Default "snell0".
+;interface = snell0
+
+; Fake-IP CIDR. Default 198.18.128.0/17 (RFC 2544 benchmark-reserved
+; sub-range, picked to *not* collide with clash's 198.18.0.0/16 or
+; sing-box's 198.18.0.0/15 defaults so opensnell can coexist on the
+; same box). Override only if you know you have a conflict.
+;fake-ip-range = 198.18.128.0/17
+
+; MTU. Default 9000.
+;mtu = 9000
+
 ; Comma-separated UIDs and/or usernames whose outbound TCP should
 ; bypass the redirect and egress direct. Usernames are resolved via
-; the system passwd database at startup.
-;
-; Typical use case: transparent TCP forwarders running as their own
-; user. The example here bypasses two services so they keep forwarding
-; with the box's own egress IP.
-exclude-uid = realm, gost
+; the system passwd database at startup. Typical use case: transparent
+; TCP forwarders running as their own user.
+;exclude-uid = realm, gost
 ```
 
 Run:
@@ -345,10 +388,10 @@ You can keep `[snell-client]` `listen = 127.0.0.1:1080` to run both the
 SOCKS5 listener and the TUN inbound at once, or set `listen = off` to
 run TUN only.
 
-Not in v1 (planned for later): UDP capture (needs a real TUN device +
-userspace IP stack); cgroup-v2 based exclusion (so a systemd unit can be
-exempted without changing its `User=`); fake-IP DNS to preserve
-hostnames on the wire as `AtypDomainName`; macOS and Windows.
+Not in v2 (planned for later): UDP application traffic capture (DNS
+itself is captured but other UDP — WebRTC, QUIC, etc. — still egresses
+direct); cgroup-v2 based exclusion (so a systemd unit can be exempted
+without changing its `User=`); macOS and Windows.
 
 ### Example end-to-end smoke test
 

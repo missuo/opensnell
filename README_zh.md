@@ -248,31 +248,64 @@ brutal-cwnd-gain = 15     ; 可选；以十分之一为单位
 ./snell-client -c snell-client.conf -v    # debug 级别日志
 ```
 
-### 实验性：TUN 入站 — 透明 TCP 接管（仅 Linux）
+### 实验性：TUN 入站 — 透明 TCP 接管 + fake-IP DNS（仅 Linux）
 
 除了 SOCKS5 监听之外，`snell-client` 还可以**透明地接管机器上所有
 新发起的出向 TCP 连接**并通过 snell 服务器转发——应用本身完全不需要
-懂 SOCKS5。
+懂 SOCKS5，而且**域名信息端到端保留**，由 snell 服务器自己做（干净的）
+DNS 解析。
 
-底层是 **nftables REDIRECT**（sing-tun 的 `auto-redirect` 模式），
-而**不是**默认路由劫持。这两种方案的区别很关键：默认路由劫持的方式会
-顺带破坏本机自身对外的服务，因为 Linux FIB 层无法在「本机服务对外回包」
-和「本机进程主动发起的新出向」之间做出区分。让 nftables + conntrack
-来做这个分类，分类语义就自然正确：
+底层是 **fake-IP DNS 劫持 + nftables REDIRECT** 双轨架构，跟
+clash / mihomo / sing-box 一致：
+
+```
+                   ┌──────────────────────────────────────────────────┐
+   App  ─DNS Q──►  │ sing-tun 把 UDP 53 DNAT 到 TUN 网关 (198.18.128.1) │
+                   └────────────────┬─────────────────────────────────┘
+                                    ▼
+                snell-client 本地 fake-IP DNS server
+                                    │   (分配 198.18.128.42 ⇄ "registry-1.docker.io")
+                                    ▼  (返回 A 198.18.128.42)
+
+   App ─TCP 443 到 198.18.128.42──► 内核走 TUN 路由 (snell0)
+                                                  │
+                                                  ▼
+                          sing-tun 用户态 "system" stack
+                                                  │
+                                                  ▼ 反查 pool：198.18.128.42 → 域名
+                                                  
+                snell.Client.DialTCP("registry-1.docker.io", 443)   ← AtypDomainName!
+                                                  │
+                                                  ▼
+                  snell 服务器用**自己的**解析器拿到真实 IP
+```
+
+为什么必须做 fake-IP：很多用户的本机 DNS 被 ISP 投毒（docker.io、
+github.com、googlevideo.com 等被解析到错 IP）。如果本机先解析、只把
+错 IP 送到 snell 服务器，snell 也救不了。Fake-IP 让 snell 服务器
+**自己**用上游（你可以在服务端 `dns = …` 里指定）去解析，**彻底绕开
+本机污染链路**。
+
+同一份二进制还顺带装好 sing-tun 的 nftables auto-redirect 处理「真
+IP 目标」（直接连 IP 不走域名的应用）。两条入站共用一个 handler。
+因为规则用 conntrack 做分类，本机自身的服务**完全不受影响**：
 
 | 流量                                                | 行为 |
 | --------------------------------------------------- | ---- |
 | 进站 TCP/UDP 到本机服务（sshd / nginx / caddy / realm…） | **不动**——`PREROUTING` 把目标为本机的 IP 全部放行 |
 | 上述服务对外的回包                                   | **不动**——`ct mark` 在 conntrack 上跳过 redirect |
-| 本机进程发起的新出向 TCP                             | **重定向** → snell 服务器 |
+| 本机进程出向 TCP（按域名）                           | **fake-IP 接管** → snell 用 `AtypDomainName` |
+| 本机进程出向 TCP（直接 IP）                          | **REDIRECT 接管** → snell 用 `AtypIPv4` |
 | `snell-client` 自己连向 snell 服务器的 TCP           | **不动**——`SO_MARK` 0x2024 在 OUTPUT 链命中并提前返回 |
-| 本机进程的 UDP / ICMP                                | **不动**——v1 只接管 TCP |
+| 本机进程的 UDP（DNS 以外）                           | **不动**——v2 只接管 DNS，其它 UDP 直连 |
+| 本机进程的 ICMP                                      | **不动** |
 | `FORWARD` 链路由转发（容器、`ip_forward=1`）         | **不动**——我们不动 FORWARD 链 |
 
 这意味着：任意来源 IP 发起的新 SSH 都能连进来；本机已有的 TCP 服务
-不会被影响；`snell-client` 进程退出或重启之后机器回到与开启 TUN 前
-完全一致的状态（nftables 表和那条优先级 1 的 `ip rule` 在
-`SIGTERM` / `SIGINT` 时由 `Inbound.Close()` 完整反卷）。
+不受影响；`SIGTERM`/`SIGINT` 后 TUN 接口、nftables 表和 sing-tun
+那条优先级 1 的 `ip rule` 全部反卷，机器回到完全干净的状态。**端到端
+已验证**——包括在 ISP DNS 被污染的机器上 `docker pull` Docker Hub
+官方镜像成功。
 
 环境要求：
 
@@ -305,12 +338,22 @@ brutal-cwnd-gain = 15     ; 可选；以十分之一为单位
 ; （SOCKS5-only）。也可以用命令行 --tun 强制开启。
 enable = true
 
+; TUN 接口名。默认 "snell0"。
+;interface = snell0
+
+; Fake-IP 网段。默认 198.18.128.0/17（RFC 2544 benchmark 保留段的子集，
+; 故意避开 clash 的 198.18.0.0/16 和 sing-box 的 198.18.0.0/15 默认，
+; 让 opensnell 可以跟它们共存于同一台机器）。除非确实碰到冲突，否则
+; 不需要改。
+;fake-ip-range = 198.18.128.0/17
+
+; MTU。默认 9000。
+;mtu = 9000
+
 ; 逗号分隔的 UID 列表或用户名列表，这些用户的出向 TCP 将旁路 redirect、
 ; 走机器原本的默认网关直连。用户名在启动时通过系统 passwd 数据库解析。
-;
-; 常见用例：透明转发类服务（每个跑在自己专用的 user 下）。下面这条
-; 配置让 realm、gost 两类服务保持以本机出口 IP 直连远端目标。
-exclude-uid = realm, gost
+; 常见用例：透明转发类服务（每个跑在自己专用的 user 下）。
+;exclude-uid = realm, gost
 ```
 
 启动：
@@ -322,10 +365,9 @@ sudo ./snell-client --tun -c snell-client.conf
 可以保留 `[snell-client]` 的 `listen = 127.0.0.1:1080` 让 SOCKS5 与
 TUN 同时运行，也可以把它改成 `listen = off` 跑纯 TUN 模式。
 
-v1 暂未实现（已列入后续计划）：UDP 流量接管（需要真正的 TUN 设备 +
-用户态 IP 协议栈）；cgroup-v2 维度的排除（让 systemd 单元不用改
-`User=` 也能精准旁路）；fake-IP DNS 让线路上以 `AtypDomainName` 编码
-保留域名信息；macOS 与 Windows。
+v2 暂未实现（已列入后续计划）：应用 UDP 流量接管（DNS 本身已接管，
+但 WebRTC / QUIC 等其它 UDP 仍走直连）；cgroup-v2 维度的排除（让
+systemd 单元不用改 `User=` 也能精准旁路）；macOS 与 Windows。
 
 ### 端到端冒烟测试示例
 

@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"os"
 	"os/signal"
 	"os/user"
@@ -31,8 +32,11 @@ type clientFileConfig struct {
 }
 
 type tunFileConfig struct {
-	enable      bool
-	excludeUIDs []uint32
+	enable       bool
+	tunName      string
+	mtu          uint32
+	fakeIPPrefix netip.Prefix
+	excludeUIDs  []uint32
 }
 
 func main() {
@@ -118,8 +122,11 @@ func main() {
 
 	if cfg.tun.enable {
 		inbound, err := tun.New(ctx, tun.Config{
-			ExcludeUIDs: cfg.tun.excludeUIDs,
-			OutputMark:  tun.DefaultOutputMark,
+			TUNName:      cfg.tun.tunName,
+			MTU:          cfg.tun.mtu,
+			FakeIPPrefix: cfg.tun.fakeIPPrefix,
+			ExcludeUIDs:  cfg.tun.excludeUIDs,
+			OutputMark:   tun.DefaultOutputMark,
 		}, client, logger)
 		if err != nil {
 			recordErr(fmt.Errorf("tun: %w", err))
@@ -211,9 +218,19 @@ func loadClientConfig(path string) (clientFileConfig, error) {
 		if err != nil {
 			return clientFileConfig{}, err
 		}
+		var fakeIPPrefix netip.Prefix
+		if rawPrefix := strings.TrimSpace(tunSec.Key("fake-ip-range").MustString("")); rawPrefix != "" {
+			fakeIPPrefix, err = netip.ParsePrefix(rawPrefix)
+			if err != nil {
+				return clientFileConfig{}, fmt.Errorf("[snell-tun] fake-ip-range %q: %w", rawPrefix, err)
+			}
+		}
 		out.tun = tunFileConfig{
-			enable:      tunSec.Key("enable").MustBool(false),
-			excludeUIDs: uids,
+			enable:       tunSec.Key("enable").MustBool(false),
+			tunName:      tunSec.Key("interface").MustString(""),
+			mtu:          uint32(tunSec.Key("mtu").MustInt(0)),
+			fakeIPPrefix: fakeIPPrefix,
+			excludeUIDs:  uids,
 		}
 	}
 
