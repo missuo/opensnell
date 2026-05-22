@@ -12,9 +12,9 @@ import (
 	"log/slog"
 )
 
-// New returns ErrUnsupported on non-linux platforms. The build still
-// includes this file so cmd/snell-client compiles everywhere; users who
-// don't pass --tun never reach this code path.
+// New returns ErrUnsupported on non-linux platforms. The same binary
+// still compiles everywhere; users who don't pass --tun never reach
+// this code path.
 func New(_ context.Context, _ Config, _ Dialer, _ *slog.Logger) (Inbound, error) {
 	return nil, ErrUnsupported
 }

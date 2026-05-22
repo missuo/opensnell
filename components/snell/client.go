@@ -13,6 +13,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/missuo/opensnell/components/obfs"
@@ -49,6 +50,13 @@ type ClientConfig struct {
 	// Linux only (uses TCP_FASTOPEN_CONNECT setsockopt). On other
 	// platforms the option is silently no-op. Off by default.
 	TFO bool
+
+	// SocketMark, if non-zero, stamps SO_MARK on outbound TCP sockets
+	// to the snell server. Used by the TUN auto-redirect inbound so its
+	// nftables rules can match the mark and skip our own outbound,
+	// preventing the snell-client→snell-server connection from being
+	// captured by its own redirect listener. Linux only.
+	SocketMark uint32
 
 	// Brutal enables apernet/tcp-brutal congestion control on outbound
 	// TCP connections to the snell server. EXPERIMENTAL: requires the
@@ -154,6 +162,47 @@ func NewClient(cfg ClientConfig, logger *slog.Logger) (*Client, error) {
 	return c, nil
 }
 
+// dialControl is the shape of net.Dialer.Control hooks (and
+// net.ListenConfig.Control hooks).
+type dialControl = func(network, address string, c syscall.RawConn) error
+
+// conditional returns hook iff cond is true, otherwise nil. Lets us
+// keep the call site readable when several optional hooks need to be
+// composed into a single Control.
+func conditional(cond bool, hook dialControl) dialControl {
+	if !cond {
+		return nil
+	}
+	return hook
+}
+
+// composeControls returns a dialControl that runs every non-nil hook in
+// order and returns the first non-nil error. Returns nil if every input
+// is nil, so the dialer's Control field stays unset and the kernel uses
+// its default path.
+func composeControls(hooks ...dialControl) dialControl {
+	active := hooks[:0]
+	for _, h := range hooks {
+		if h != nil {
+			active = append(active, h)
+		}
+	}
+	if len(active) == 0 {
+		return nil
+	}
+	if len(active) == 1 {
+		return active[0]
+	}
+	return func(network, address string, c syscall.RawConn) error {
+		for _, h := range active {
+			if err := h(network, address, c); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
 // maybeApplyBrutal applies tcp-brutal CC to a fresh outbound TCP conn
 // when enabled in the client config. Logged-but-non-fatal on failure.
 func (c *Client) maybeApplyBrutal(conn net.Conn) {
@@ -170,9 +219,10 @@ func (c *Client) maybeApplyBrutal(conn net.Conn) {
 // CONNECT header written yet.
 func (c *Client) dialFresh(ctx context.Context) (*Snell, error) {
 	dialer := net.Dialer{Timeout: c.cfg.DialTimeout}
-	if c.cfg.TFO {
-		dialer.Control = applyTFODial
-	}
+	dialer.Control = composeControls(
+		conditional(c.cfg.TFO, applyTFODial),
+		applyMarkDial(c.cfg.SocketMark),
+	)
 	raw, err := dialer.DialContext(ctx, "tcp", c.cfg.Server)
 	if err != nil {
 		return nil, err

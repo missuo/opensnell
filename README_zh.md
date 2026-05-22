@@ -248,27 +248,53 @@ brutal-cwnd-gain = 15     ; 可选；以十分之一为单位
 ./snell-client -c snell-client.conf -v    # debug 级别日志
 ```
 
-### 实验性：TUN 入站（仅 Linux）
+### 实验性：TUN 入站 — 透明 TCP 接管（仅 Linux）
 
-除了本地 SOCKS5 监听之外，`snell-client` 还可以接管一张 TUN 网卡作为
-系统默认路由，让机器上 *所有* 进程都透明地通过 snell 服务器出网 —
-不需要应用本身懂 SOCKS5。这与 Clash / sing-box 的 tun-inbound 形态
-一致，底层使用 [sagernet/sing-tun](https://github.com/SagerNet/sing-tun)
-的 `system` 用户态 stack（不需要 `with_gvisor` 构建 tag）。
+除了 SOCKS5 监听之外，`snell-client` 还可以**透明地接管机器上所有
+新发起的出向 TCP 连接**并通过 snell 服务器转发——应用本身完全不需要
+懂 SOCKS5。
 
-要求与注意事项：
+底层是 **nftables REDIRECT**（sing-tun 的 `auto-redirect` 模式），
+而**不是**默认路由劫持。这两种方案的区别很关键：默认路由劫持的方式会
+顺带破坏本机自身对外的服务，因为 Linux FIB 层无法在「本机服务对外回包」
+和「本机进程主动发起的新出向」之间做出区分。让 nftables + conntrack
+来做这个分类，分类语义就自然正确：
 
-- **仅 Linux**（依赖 `/dev/net/tun`、`ip route`、`ip rule`）。其他平台
-  仍可编译同一份二进制，但 `--tun` 会直接返回不支持错误。
-- **需要 `CAP_NET_ADMIN`**（实际操作上：以 root 运行，或通过 systemd
-  `AmbientCapabilities` 授权）。**只用 SOCKS5 模式时仍然不需要 root。**
-- **DNS 透传，线路上仅有 IP。** 主机发起的 DNS 查询会以 UDP 形式通过
-  TUN 出去，内核侧先做本地名字解析，最终送到 snell 服务器的是解析后
-  的 IP。也就是说当前实现下 snell 以 `AtypIPv4`/`AtypIPv6` 编码目的地，
-  而不是 `AtypDomainName`；未来可能加入 fake-IP DNS 来保留原始域名。
-- **服务器 IP 会被自动从 TUN 默认路由中排除**，避免 `snell-client` 到
-  snell 服务器的出向 TCP 自身回环。如果 `server = host:port` 是域名，
-  会在启动时解析一次并锁定到 IP，进程生命周期内不再重新解析。
+| 流量                                                | 行为 |
+| --------------------------------------------------- | ---- |
+| 进站 TCP/UDP 到本机服务（sshd / nginx / caddy / realm…） | **不动**——`PREROUTING` 把目标为本机的 IP 全部放行 |
+| 上述服务对外的回包                                   | **不动**——`ct mark` 在 conntrack 上跳过 redirect |
+| 本机进程发起的新出向 TCP                             | **重定向** → snell 服务器 |
+| `snell-client` 自己连向 snell 服务器的 TCP           | **不动**——`SO_MARK` 0x2024 在 OUTPUT 链命中并提前返回 |
+| 本机进程的 UDP / ICMP                                | **不动**——v1 只接管 TCP |
+| `FORWARD` 链路由转发（容器、`ip_forward=1`）         | **不动**——我们不动 FORWARD 链 |
+
+这意味着：任意来源 IP 发起的新 SSH 都能连进来；本机已有的 TCP 服务
+不会被影响；`snell-client` 进程退出或重启之后机器回到与开启 TUN 前
+完全一致的状态（nftables 表和那条优先级 1 的 `ip rule` 在
+`SIGTERM` / `SIGINT` 时由 `Inbound.Close()` 完整反卷）。
+
+环境要求：
+
+- **仅 Linux**，内核加载 `nf_tables` + `nf_conntrack` 模块（Debian 12+
+  / RHEL 9+ 默认满足）。
+- **`nft` 命令在 `$PATH` 里**。
+- **需要 `CAP_NET_ADMIN`**（实际操作就是以 root 运行，或通过 systemd
+  `AmbientCapabilities` 授权）。**只用 SOCKS5 模式时仍然不需要 root**，
+  同一份二进制两种用法都行。
+
+让特定的服务（`realm` / `gost` / `socat` 这类端口转发器）从重定向中
+旁路出去——这些工具的出向语义是「透明转发到远端目标」，你通常希望它们
+继续走本机自然出口，而**不是**被改道到 snell 服务器：
+
+- Linux 的 nftables 在内核层面只能按 **UID** 或 **GID** 来匹配 socket
+  的归属。`PID` 不稳定不能用，**进程名 / `comm` 在 netfilter 层根本
+  不暴露**——这是 Linux 内核的硬限制，对 clash / sing-box / v2ray-redir
+  / ss-redir 等所有透明代理都一样。
+- 标准做法是让转发器进程以独立用户运行。对 systemd 管理的服务，
+  在 unit 文件里加 `User=realm`（先 `useradd -r realm` 创建一个系统
+  用户）。
+- 然后在下面的 `exclude-uid` 里把对应的用户名/UID 列出来。
 
 在原有 `[snell-client]` 之外加一个 `[snell-tun]` 段：
 
@@ -279,30 +305,27 @@ brutal-cwnd-gain = 15     ; 可选；以十分之一为单位
 ; （SOCKS5-only）。也可以用命令行 --tun 强制开启。
 enable = true
 
-; TUN 接口名。留空时自动取下一个空闲的 tunN。
-interface = tun0
-
-; TUN 自身的 IPv4 地址 + 子网。默认 198.18.0.1/16，避开常见 RFC1918 段。
-address = 198.18.0.1/16
-
-; MTU。默认 9000（与 sing-tun system stack 友好）。
-mtu = 9000
-
-; 自动安装 ip route / ip rule，把流量导入 TUN。如果你想自己接管路由表
-; （比如自定义规则、fwmark、分流），设为 false，再用你自己的规则把
-; 目标流量导入这张网卡。默认 true。
-auto-route = true
+; 逗号分隔的 UID 列表或用户名列表，这些用户的出向 TCP 将旁路 redirect、
+; 走机器原本的默认网关直连。用户名在启动时通过系统 passwd 数据库解析。
+;
+; 常见用例：透明转发类服务（每个跑在自己专用的 user 下）。下面这条
+; 配置让 realm、gost 两类服务保持以本机出口 IP 直连远端目标。
+exclude-uid = realm, gost
 ```
 
-可以保留 `[snell-client]` 的 `listen = 127.0.0.1:1080` 让 SOCKS5 与 TUN
-同时运行，也可以把它改成 `listen = off` 跑纯 TUN 模式。
+启动：
 
 ```sh
 sudo ./snell-client --tun -c snell-client.conf
 ```
 
-v1 暂未实现（已列入后续计划）：fake-IP DNS 以保留域名信息；TUN 内 IPv6；
-macOS 与 Windows。
+可以保留 `[snell-client]` 的 `listen = 127.0.0.1:1080` 让 SOCKS5 与
+TUN 同时运行，也可以把它改成 `listen = off` 跑纯 TUN 模式。
+
+v1 暂未实现（已列入后续计划）：UDP 流量接管（需要真正的 TUN 设备 +
+用户态 IP 协议栈）；cgroup-v2 维度的排除（让 systemd 单元不用改
+`User=` 也能精准旁路）；fake-IP DNS 让线路上以 `AtypDomainName` 编码
+保留域名信息；macOS 与 Windows。
 
 ### 端到端冒烟测试示例
 

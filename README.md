@@ -262,33 +262,58 @@ Run:
 ./snell-client -c snell-client.conf -v    # debug level logs
 ```
 
-### EXPERIMENTAL: TUN inbound (Linux only)
+### EXPERIMENTAL: TUN inbound — transparent TCP capture (Linux only)
 
-In addition to the SOCKS5 listener, `snell-client` can attach itself to a
-local TUN device and become the system-wide default route, so that *every*
-process on the machine transparently egresses through the snell server —
-no SOCKS5 awareness required on the app side. This is similar to how
-Clash / sing-box's tun-inbound works, and it runs on top of
-[sagernet/sing-tun](https://github.com/SagerNet/sing-tun) using the
-`system` userspace stack (no `with_gvisor` build tag required).
+In addition to the SOCKS5 listener, `snell-client` can transparently
+capture **every new outbound TCP connection** on the machine and tunnel
+it through the snell server — no SOCKS5 awareness required from the app
+side.
 
-Requirements and caveats:
+The mechanism is **nftables-based REDIRECT** (sing-tun's "auto-redirect"
+mode), not a default-route hijack. This matters: an `ip rule` style
+hijack would also break the host's own services because the kernel can't
+tell "reply to an inbound connection" from "new outbound from a local
+process" in the FIB layer. Letting nftables + conntrack do the
+classification gives us the right semantics for free:
 
-- **Linux only** (uses `/dev/net/tun`, `ip route`, `ip rule`). Other
-  platforms build the same binary but `--tun` returns an error.
+| Traffic                                              | Behavior |
+| ---------------------------------------------------- | -------- |
+| Inbound TCP/UDP to local services (sshd, nginx, caddy, realm, …) | **Unchanged** — `PREROUTING` excludes local destinations |
+| Reply packets from those services back to the client | **Unchanged** — `ct mark` on the conntrack entry bypasses redirect |
+| New outbound TCP from local processes                | **Redirected** → snell server |
+| `snell-client`'s own connection to the snell server  | **Unchanged** — `SO_MARK` 0x2024 is matched in OUTPUT and returns early |
+| UDP / ICMP from local processes                      | **Unchanged** — v1 is TCP-only |
+| `FORWARD`-chain routed traffic (containers, `ip_forward=1`) | **Unchanged** — we don't touch FORWARD |
+
+This means new SSH sessions from any source can still connect, existing
+TCP services on the box keep working, and a reboot or process restart of
+`snell-client` leaves the host in the same state as before (the
+nftables table and a single `ip rule` priority 1 entry are torn down
+in the `Inbound.Close()` path on `SIGTERM` / `SIGINT`).
+
+Requirements:
+
+- **Linux only**, kernel with `nf_tables` + `nf_conntrack` modules
+  loaded (Debian 12+ / RHEL 9+ default).
+- **`nft` userspace binary present** in `$PATH`.
 - **Needs `CAP_NET_ADMIN`** (in practice: run as root, or grant the
-  capability via systemd `AmbientCapabilities`). Plain SOCKS5 mode still
-  does not require root.
-- **Transparent DNS, IP-only on the wire.** DNS queries from the host
-  flow through the TUN like any other UDP — the kernel does name
-  resolution locally, then the resolved IP is what reaches the snell
-  server. This means snell encodes destinations as `AtypIPv4`/`AtypIPv6`,
-  not `AtypDomainName`; a future iteration may add a fake-IP DNS so
-  hostnames are preserved.
-- **Server IP is auto-excluded** from the TUN's default route, so the
-  outbound TCP from `snell-client` to the snell server does not loop. If
-  your `server = host:port` is a hostname, it is resolved once at
-  startup and pinned to its IP for the lifetime of the process.
+  capability via systemd `AmbientCapabilities`). Plain SOCKS5 mode
+  remains usable without root from the same binary.
+
+Excluding specific services (`realm`, `gost`, `socat`-style port
+forwarders) from the redirect — these tools' outbound is "transparent
+forwarding to a remote target" and you usually want it to keep egressing
+direct, not through the snell server:
+
+- nftables in Linux can only match by **UID** or **GID** of the socket
+  owner. `PID` is unstable and process name / `comm` is **not exposed**
+  to netfilter at all (a hard kernel-level limitation that applies to
+  every transparent proxy on Linux — clash, sing-box, v2ray-redir,
+  ss-redir, etc.).
+- The standard fix is to make the forwarder run under its own user.
+  For a systemd-managed service, add `User=realm` to the unit (and
+  give it a dedicated `useradd -r realm`).
+- Then list those users in `exclude-uid` below.
 
 Add a `[snell-tun]` section alongside the existing `[snell-client]`:
 
@@ -300,32 +325,30 @@ Add a `[snell-tun]` section alongside the existing `[snell-client]`:
 ; on with the --tun command-line flag.
 enable = true
 
-; TUN interface name. Empty picks the next free tunN.
-interface = tun0
-
-; The TUN's own IPv4 address + subnet. Default 198.18.0.1/16 keeps the
-; inside-TUN subnet clear of common RFC1918 ranges.
-address = 198.18.0.1/16
-
-; MTU. Default 9000 (friendly to the sing-tun system stack).
-mtu = 9000
-
-; Install ip route / ip rule so traffic enters the TUN automatically.
-; If you'd rather wire routing up yourself (custom rules, fwmark, split
-; tunnel), set this to false and configure your own rules pointing into
-; the interface. Default true.
-auto-route = true
+; Comma-separated UIDs and/or usernames whose outbound TCP should
+; bypass the redirect and egress direct. Usernames are resolved via
+; the system passwd database at startup.
+;
+; Typical use case: transparent TCP forwarders running as their own
+; user. The example here bypasses two services so they keep forwarding
+; with the box's own egress IP.
+exclude-uid = realm, gost
 ```
 
-You can keep `[snell-client]` `listen = 127.0.0.1:1080` to run both
-inbounds at once, or set `listen = off` to run TUN only.
+Run:
 
 ```sh
 sudo ./snell-client --tun -c snell-client.conf
 ```
 
-Not in v1 (planned): fake-IP DNS to preserve hostnames; IPv6 inside the
-TUN; macOS and Windows.
+You can keep `[snell-client]` `listen = 127.0.0.1:1080` to run both the
+SOCKS5 listener and the TUN inbound at once, or set `listen = off` to
+run TUN only.
+
+Not in v1 (planned for later): UDP capture (needs a real TUN device +
+userspace IP stack); cgroup-v2 based exclusion (so a systemd unit can be
+exempted without changing its `User=`); fake-IP DNS to preserve
+hostnames on the wire as `AtypDomainName`; macOS and Windows.
 
 ### Example end-to-end smoke test
 

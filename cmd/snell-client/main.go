@@ -10,10 +10,10 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
-	"net"
-	"net/netip"
 	"os"
 	"os/signal"
+	"os/user"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -31,11 +31,8 @@ type clientFileConfig struct {
 }
 
 type tunFileConfig struct {
-	enable    bool
-	iface     string
-	address   string
-	mtu       uint32
-	autoRoute bool
+	enable      bool
+	excludeUIDs []uint32
 }
 
 func main() {
@@ -68,26 +65,13 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// In TUN mode we must lock in the snell server's IP *before* the TUN
-	// becomes the default route — otherwise a subsequent re-resolve of
-	// the server hostname would itself traverse the TUN and loop. We
-	// also feed the resolved IPs to sing-tun's auto-route exclude list.
-	var tunServerIPs []netip.Addr
+	// In TUN mode the snell client's own outbound to the snell server
+	// must be tagged with SO_MARK so the auto-redirect nftables rules
+	// can match it and bypass the redirect. Without this, the
+	// snell-client→snell-server connection would itself be captured by
+	// our own listener and loop.
 	if cfg.tun.enable {
-		ips, err := resolveServerIPs(ctx, cfg.snellCfg.Server)
-		if err != nil {
-			logger.Error("resolve snell server for tun mode", "server", cfg.snellCfg.Server, "err", err)
-			os.Exit(1)
-		}
-		if len(ips) == 0 {
-			logger.Error("snell server resolved to zero addresses", "server", cfg.snellCfg.Server)
-			os.Exit(1)
-		}
-		tunServerIPs = ips
-		if rewritten, ok := rewriteServerToIP(cfg.snellCfg.Server, ips[0]); ok {
-			logger.Info("tun mode: pinned snell server IP", "from", cfg.snellCfg.Server, "to", rewritten)
-			cfg.snellCfg.Server = rewritten
-		}
+		cfg.snellCfg.SocketMark = tun.DefaultOutputMark
 	}
 
 	client, err := snell.NewClient(cfg.snellCfg, logger)
@@ -133,7 +117,10 @@ func main() {
 	}
 
 	if cfg.tun.enable {
-		inbound, err := startTUN(ctx, cfg, tunServerIPs, client, logger)
+		inbound, err := tun.New(ctx, tun.Config{
+			ExcludeUIDs: cfg.tun.excludeUIDs,
+			OutputMark:  tun.DefaultOutputMark,
+		}, client, logger)
 		if err != nil {
 			recordErr(fmt.Errorf("tun: %w", err))
 		} else {
@@ -155,62 +142,42 @@ func main() {
 	}
 }
 
-// startTUN brings up the TUN inbound. The server IP(s) were resolved
-// earlier (before snell.NewClient) and are passed in so sing-tun's
-// auto-route can exclude them.
-func startTUN(ctx context.Context, cfg clientFileConfig, serverIPs []netip.Addr, client *snell.Client, logger *slog.Logger) (tun.Inbound, error) {
-	prefix, err := netip.ParsePrefix(cfg.tun.address)
-	if err != nil {
-		return nil, fmt.Errorf("invalid tun address %q: %w", cfg.tun.address, err)
-	}
-
-	return tun.New(ctx, tun.Config{
-		Name:      cfg.tun.iface,
-		Address:   prefix,
-		MTU:       cfg.tun.mtu,
-		AutoRoute: cfg.tun.autoRoute,
-		ServerIPs: serverIPs,
-	}, client, logger)
-}
-
-// rewriteServerToIP replaces a "host:port" form with "ip:port", returning
-// (rewritten, true) when the host part is not already an IP literal.
-func rewriteServerToIP(server string, ip netip.Addr) (string, bool) {
-	host, port, err := net.SplitHostPort(server)
-	if err != nil {
-		return server, false
-	}
-	if _, err := netip.ParseAddr(host); err == nil {
-		return server, false
-	}
-	return net.JoinHostPort(ip.String(), port), true
-}
-
-func resolveServerIPs(ctx context.Context, server string) ([]netip.Addr, error) {
-	host, _, err := net.SplitHostPort(server)
-	if err != nil {
-		return nil, err
-	}
-	if addr, err := netip.ParseAddr(host); err == nil {
-		return []netip.Addr{addr}, nil
-	}
-	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]netip.Addr, 0, len(addrs))
-	for _, a := range addrs {
-		out = append(out, a.Unmap())
-	}
-	return out, nil
-}
-
 func socks5Enabled(listen string) bool {
 	switch strings.ToLower(strings.TrimSpace(listen)) {
 	case "", "off", "none", "disabled":
 		return false
 	}
 	return true
+}
+
+// parseExcludeUIDs splits a comma-separated list of UIDs / usernames and
+// resolves each entry to a numeric UID. Names are looked up via the
+// system user database (NSS). Empty / whitespace entries are ignored.
+func parseExcludeUIDs(raw string) ([]uint32, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var out []uint32
+	for _, item := range strings.Split(raw, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if n, err := strconv.ParseUint(item, 10, 32); err == nil {
+			out = append(out, uint32(n))
+			continue
+		}
+		u, err := user.Lookup(item)
+		if err != nil {
+			return nil, fmt.Errorf("exclude-uid: unknown user %q: %w", item, err)
+		}
+		n, err := strconv.ParseUint(u.Uid, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("exclude-uid: %q has non-numeric UID %q: %w", item, u.Uid, err)
+		}
+		out = append(out, uint32(n))
+	}
+	return out, nil
 }
 
 func loadClientConfig(path string) (clientFileConfig, error) {
@@ -239,20 +206,14 @@ func loadClientConfig(path string) (clientFileConfig, error) {
 		},
 	}
 
-	// Always start from defaults so that --tun on the command line works
-	// even when the config file has no [snell-tun] section at all.
-	out.tun = tunFileConfig{
-		address:   "198.18.0.1/16",
-		mtu:       9000,
-		autoRoute: true,
-	}
 	if tunSec, err := f.GetSection("snell-tun"); err == nil {
+		uids, err := parseExcludeUIDs(tunSec.Key("exclude-uid").MustString(""))
+		if err != nil {
+			return clientFileConfig{}, err
+		}
 		out.tun = tunFileConfig{
-			enable:    tunSec.Key("enable").MustBool(false),
-			iface:     tunSec.Key("interface").MustString(""),
-			address:   tunSec.Key("address").MustString("198.18.0.1/16"),
-			mtu:       uint32(tunSec.Key("mtu").MustInt(9000)),
-			autoRoute: tunSec.Key("auto-route").MustBool(true),
+			enable:      tunSec.Key("enable").MustBool(false),
+			excludeUIDs: uids,
 		}
 	}
 
