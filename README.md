@@ -268,61 +268,94 @@ In addition to the SOCKS5 listener, `snell-client` can transparently
 capture **every new outbound TCP connection** on the machine and tunnel
 it through the snell server — no SOCKS5 awareness required from the
 app side, and **with the original hostname preserved end-to-end** so
-the snell server does its own (clean) DNS resolution.
+the snell server does its own (clean) DNS resolution. Same general
+architecture clash / mihomo / sing-box use.
 
-The implementation is **IPv4-only by design** on both platforms.
-AAAA queries get an empty NOERROR reply so resolvers fall back to A;
-the snell server then resolves the hostname against its own DNS and
-connects via v4. This sidesteps the case where a v6-capable host's
-DNS path bypasses our fake-IP layer or where the snell server can't
-reach v6 destinations.
+#### Architecture
 
-The mechanism differs per OS because the kernel hooks available
-differ, but the user-facing behavior converges:
-
-| Platform | TCP capture | DNS capture | Reason |
-| -------- | ----------- | ----------- | ------ |
-| Linux    | `nftables` REDIRECT + fake-IP TUN | `nftables` DNAT of UDP/TCP :53 → TUN-gateway DNS server | nftables exists; lets us preserve inbound services + use SO_MARK to bypass our own outbound |
-| macOS    | TUN auto-route covers all of v4 (sub-prefix routes 1/8 … 128/1 via TUN, with snell server IP excluded) | Programmatic system-DNS override: every active network service's resolver is reset to the TUN gateway IP at startup, restored on exit. `mDNSResponder` then sends every query into our TUN | macOS has no netfilter equivalent for redirect; also its scoped routing makes a default-route hijack alone insufficient because mDNSResponder binds DNS to the Wi-Fi/Ethernet source interface and bypasses the default route |
-
-Same architecture clash / mihomo / sing-box use — example flow on
-Linux:
+The two platforms have different kernel hooks for DNS interception
+and outbound TCP capture, but both funnel into the same userspace
+fake-IP pipeline:
 
 ```
-                   ┌──────────────────────────────────────────────────┐
-   App  ─DNS Q──►  │ sing-tun DNATs UDP 53 to TUN gateway (198.18.128.1) │
-                   └────────────────┬─────────────────────────────────┘
-                                    ▼
-                snell-client's local fake-IP DNS server
-                                    │   (allocates 198.18.128.42 ⇄ "registry-1.docker.io")
-                                    ▼  (returns A 198.18.128.42)
-
-   App ─TCP 443 to 198.18.128.42──► kernel routes via TUN (snell0)
-                                                  │
-                                                  ▼
-                          sing-tun userspace "system" stack
-                                                  │
-                                                  ▼ reverse-lookup pool: 198.18.128.42 → name
-                                                  
-                snell.Client.DialTCP("registry-1.docker.io", 443)   ← AtypDomainName!
-                                                  │
-                                                  ▼
-                  snell server uses its own resolver, gets the real IP
+   ┌──────────────── Linux ─────────────────┐  ┌──────────────── macOS ────────────────┐
+   │ nftables DNAT UDP/TCP :53              │  │ programmatic system DNS override:     │
+   │   → 198.18.128.1:53  (TUN gateway)     │  │  networksetup -setdnsservers <svc>    │
+   │                                        │  │   198.18.128.1   (restored on exit)   │
+   └────────────────────┬───────────────────┘  └────────────────────┬──────────────────┘
+                        ▼                                           ▼
+                  ┌─────────────────────────────────────────────────┐
+                  │  in-process fake-IP DNS server                  │
+                  │  A    → allocate 198.18.128.N for hostname,     │
+                  │         return; pool is LRU, bidirectional      │
+                  │  AAAA → empty NOERROR (apps fall back to A)     │
+                  │  other types → SERVFAIL (we don't forward)      │
+                  └────────────────────┬────────────────────────────┘
+                                       ▼
+   ┌──────────────── Linux ─────────────────┐  ┌──────────────── macOS ────────────────┐
+   │ outbound TCP capture:                  │  │ outbound TCP capture:                 │
+   │   sing-tun "system" stack on TUN       │  │   TUN auto-route with 8 sub-prefixes  │
+   │   handles fake-IP TCP;                 │  │   (1/8, 2/7, 4/6, 8/5, 16/4, 32/3,    │
+   │   sing-tun AutoRedirect (nftables      │  │   64/2, 128/1) covering all of v4,    │
+   │   REDIRECT) handles real-IP TCP        │  │   snell server IP excluded            │
+   └────────────────────┬───────────────────┘  └────────────────────┬──────────────────┘
+                        ▼                                           ▼
+                  ┌─────────────────────────────────────────────────┐
+                  │  shared handler:                                │
+                  │   dst ∈ fake-IP prefix? → reverse-lookup pool   │
+                  │                          → DialTCP(name, port)  │
+                  │                            with AtypDomainName  │
+                  │   else                  → DialTCP(ip, port)     │
+                  │                            with AtypIPv4        │
+                  └────────────────────┬────────────────────────────┘
+                                       ▼
+                          snell server (its own resolver)
+                                       │
+                                       ▼
+                          real destination, clean DNS
 ```
 
 Why the fake-IP layer matters: many users live behind ISP DNS that
-**poisons** docker.io, github.com, googlevideo.com etc. — if the local
-host resolves and only an IP reaches the snell server, the IP is
-already wrong and snell can do nothing about it. With fake-IP, the
-snell server itself does the resolution from its presumably uncontaminated
-upstream (and you can pin that upstream via the server's `dns = …`).
+**poisons** docker.io, github.com, googlevideo.com etc. — if the
+local host resolves and only an IP reaches the snell server, the IP
+is already wrong and snell can do nothing about it. With fake-IP,
+the snell server itself does the resolution from its presumably
+uncontaminated upstream (and you can pin that upstream via the
+server's `dns = …`).
 
-The same binary also installs sing-tun's nftables auto-redirect (on
-Linux) or auto-route sub-prefixes (on macOS) for real-IP destinations
-— apps that connect to literal IPs, not hostnames. Both fake-IP and
-real-IP paths share one handler.
+#### IPv4-only, by design
 
-Behavior table by traffic class, with platform notes called out where
+Both platforms run an **IPv4-only** fake-IP path. AAAA queries get
+an empty NOERROR reply so resolvers fall back to A; the snell server
+then resolves the hostname against its own DNS and connects v4. This
+sidesteps two distinct failure modes: (a) v6-capable hosts whose v6
+DNS path bypasses our fake-IP layer entirely, and (b) v4-only snell
+servers that can't reach v6 destinations.
+
+#### Per-platform mechanism
+
+| Concern                                        | Linux                                              | macOS                                                |
+| ---------------------------------------------- | -------------------------------------------------- | ---------------------------------------------------- |
+| DNS interception                               | `nftables` DNAT of UDP/TCP :53 to TUN gateway      | `networksetup -setdnsservers` override per service (captured + restored on exit) |
+| Outbound TCP to fake-IP                        | sing-tun "system" stack on the TUN device          | same                                                 |
+| Outbound TCP to real-IP                        | sing-tun `AutoRedirect` (nftables REDIRECT)        | TUN auto-route default-route hijack (8 sub-prefixes) |
+| Bypass for snell-client's own outbound to server | `SO_MARK 0x2024` matched in OUTPUT chain         | snell server IP installed as `Inet4RouteExcludeAddress` |
+| Preserving host's inbound services             | precise (conntrack-based PREROUTING bypass)        | works for typical workstations; do not run on hosts that accept public inbound connections |
+| Per-process exclusion (`realm`/`gost` etc.)    | `exclude-uid` (nftables UID match)                 | not supported (macOS has no equivalent kernel hook)  |
+| Cleanup on `SIGTERM`/`SIGINT`                  | nftables table dropped, `ip rule` priority-1 entry removed | utun destroyed, auto-routes deleted, system DNS restored |
+
+The reason DNS interception differs: macOS's `mDNSResponder` uses
+per-network-service DNS scoping, binding queries to the
+Wi-Fi/Ethernet source interface so they egress that interface
+directly — a default-route hijack alone never sees them. Replacing
+the configured DNS with the TUN gateway IP (which only exists on
+the utun device) is what makes scoped routing send the queries
+into our TUN. Linux has no such scoping; nftables DNAT at the OUTPUT
+chain catches everything regardless of the configured resolver.
+
+#### Behavior by traffic class
+
+Per-traffic-type cheat sheet, with platform notes called out where
 they differ:
 
 | Traffic                                              | Behavior |
@@ -338,28 +371,27 @@ they differ:
 | ICMP from local processes                            | **Linux: unchanged.** **macOS: dropped** |
 | `FORWARD`-chain / IP-forwarded traffic               | **Linux: unchanged** (we don't touch FORWARD). **macOS: not applicable** |
 
-This means on Linux new SSH sessions from any source can still
-connect, existing TCP services on the box keep working, and a
-`SIGTERM`/`SIGINT` to `snell-client` removes the TUN interface, the
-nftables table, and the one `ip rule` priority-1 entry sing-tun
-installs — leaving the host exactly as it was before. Verified
-end-to-end including `docker pull` of Docker Hub official images on a
-box with poisoned ISP DNS.
+On **Linux**: new SSH sessions from any source can still connect,
+existing TCP services on the box keep working, and a `SIGTERM`/
+`SIGINT` to `snell-client` removes the TUN interface, the nftables
+table, and the one `ip rule` priority-1 entry sing-tun installs —
+leaving the host exactly as it was before. Verified end-to-end
+including `docker pull` of Docker Hub official images on a box with
+poisoned ISP DNS.
 
-**macOS caveat**: because macOS has no nftables equivalent that sing-tun
-supports, the implementation is auto-route based — the TUN takes the
-default route via eight sub-prefixes (1/8, 2/7, 4/6, …, 128/1). This
-means **inbound services running on the macOS host that need to reply
-out to a remote client will not work while TUN is up** (reply packets
-get pulled into the TUN and forwarded through snell, which doesn't
-have a back-channel to the original client). For typical macOS
-desktop usage — i.e. nothing on the box accepts inbound connections —
-this is invisible. If you run a public-facing service on your Mac,
-keep TUN off. Linux users get the surgical-cut behavior via nftables
-because the kernel offers the right hook; macOS users get the blunter
-auto-route because that's what's available.
+On **macOS**: the same SIGTERM cleanup additionally restores every
+network service's DNS to its pre-override state. The auto-route
+default-route hijack is bluntier than Linux's nftables REDIRECT, so
+**inbound services running on the macOS host that need to reply out
+to a remote client will not work while TUN is up** (reply packets
+get pulled into the TUN and forwarded through snell, which has no
+back-channel to the original client). For typical macOS desktop
+usage — i.e. nothing on the box accepts inbound connections — this
+is invisible. If you run a public-facing service on your Mac, keep
+TUN off. Verified end-to-end including HTTPS to Google on a host
+with ISP-poisoned DHCP DNS.
 
-Requirements:
+#### Requirements
 
 - **Linux:** kernel with `nf_tables` + `nf_conntrack` modules loaded
   (Debian 12+ / RHEL 9+ default), `nft` userspace binary in `$PATH`,
@@ -370,10 +402,12 @@ Requirements:
 - Plain SOCKS5 mode remains usable without root from the same binary
   on both platforms.
 
-Excluding specific services (`realm`, `gost`, `socat`-style port
-forwarders) from the redirect — these tools' outbound is "transparent
-forwarding to a remote target" and you usually want it to keep egressing
-direct, not through the snell server:
+#### Excluding specific services (Linux only)
+
+If you run transparent forwarders (`realm`, `gost`, `socat`-style
+port-forwarders) on the same box, you usually want them to keep
+egressing direct (the snell server is not the target of the
+forwarder; the forwarder *is* the target of someone else):
 
 - nftables in Linux can only match by **UID** or **GID** of the socket
   owner. `PID` is unstable and process name / `comm` is **not exposed**
@@ -384,6 +418,14 @@ direct, not through the snell server:
   For a systemd-managed service, add `User=realm` to the unit (and
   give it a dedicated `useradd -r realm`).
 - Then list those users in `exclude-uid` below.
+
+On **macOS** this knob does not exist — there is no kernel hook to
+match outbound sockets by UID. If you need to bypass a specific
+process on Mac, you would have to configure that process to dial via
+a different mechanism (SOCKS5 directly, network namespace, etc.)
+instead of relying on the TUN capture.
+
+#### Configuration
 
 Add a `[snell-tun]` section alongside the existing `[snell-client]`:
 
