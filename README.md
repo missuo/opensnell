@@ -45,6 +45,7 @@ the current Surge `snell-server` speaks.
 | TCP Fast Open (Linux only)            | ✅             | ✅             |
 | **QUIC proxy mode (v5)**              | ✅             | use Surge      |
 | **`tcp-brutal` CC (experimental, Linux only)** | ✅    | ✅             |
+| **TUN inbound (experimental, Linux only)**     | —     | ✅             |
 
 ## Install
 
@@ -260,6 +261,71 @@ Run:
 ./snell-client -c snell-client.conf       # info level logs
 ./snell-client -c snell-client.conf -v    # debug level logs
 ```
+
+### EXPERIMENTAL: TUN inbound (Linux only)
+
+In addition to the SOCKS5 listener, `snell-client` can attach itself to a
+local TUN device and become the system-wide default route, so that *every*
+process on the machine transparently egresses through the snell server —
+no SOCKS5 awareness required on the app side. This is similar to how
+Clash / sing-box's tun-inbound works, and it runs on top of
+[sagernet/sing-tun](https://github.com/SagerNet/sing-tun) using the
+`system` userspace stack (no `with_gvisor` build tag required).
+
+Requirements and caveats:
+
+- **Linux only** (uses `/dev/net/tun`, `ip route`, `ip rule`). Other
+  platforms build the same binary but `--tun` returns an error.
+- **Needs `CAP_NET_ADMIN`** (in practice: run as root, or grant the
+  capability via systemd `AmbientCapabilities`). Plain SOCKS5 mode still
+  does not require root.
+- **Transparent DNS, IP-only on the wire.** DNS queries from the host
+  flow through the TUN like any other UDP — the kernel does name
+  resolution locally, then the resolved IP is what reaches the snell
+  server. This means snell encodes destinations as `AtypIPv4`/`AtypIPv6`,
+  not `AtypDomainName`; a future iteration may add a fake-IP DNS so
+  hostnames are preserved.
+- **Server IP is auto-excluded** from the TUN's default route, so the
+  outbound TCP from `snell-client` to the snell server does not loop. If
+  your `server = host:port` is a hostname, it is resolved once at
+  startup and pinned to its IP for the lifetime of the process.
+
+Add a `[snell-tun]` section alongside the existing `[snell-client]`:
+
+```ini
+[snell-tun]
+
+; Master switch. Defaults to false — without this, snell-client behaves
+; exactly like the SOCKS5-only build it always has. Can also be forced
+; on with the --tun command-line flag.
+enable = true
+
+; TUN interface name. Empty picks the next free tunN.
+interface = tun0
+
+; The TUN's own IPv4 address + subnet. Default 198.18.0.1/16 keeps the
+; inside-TUN subnet clear of common RFC1918 ranges.
+address = 198.18.0.1/16
+
+; MTU. Default 9000 (friendly to the sing-tun system stack).
+mtu = 9000
+
+; Install ip route / ip rule so traffic enters the TUN automatically.
+; If you'd rather wire routing up yourself (custom rules, fwmark, split
+; tunnel), set this to false and configure your own rules pointing into
+; the interface. Default true.
+auto-route = true
+```
+
+You can keep `[snell-client]` `listen = 127.0.0.1:1080` to run both
+inbounds at once, or set `listen = off` to run TUN only.
+
+```sh
+sudo ./snell-client --tun -c snell-client.conf
+```
+
+Not in v1 (planned): fake-IP DNS to preserve hostnames; IPv6 inside the
+TUN; macOS and Windows.
 
 ### Example end-to-end smoke test
 

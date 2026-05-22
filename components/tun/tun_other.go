@@ -1,0 +1,20 @@
+/*
+ * This file is part of opensnell.
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+//go:build !linux
+
+package tun
+
+import (
+	"context"
+	"log/slog"
+)
+
+// New returns ErrUnsupported on non-linux platforms. The build still
+// includes this file so cmd/snell-client compiles everywhere; users who
+// don't pass --tun never reach this code path.
+func New(_ context.Context, _ Config, _ Dialer, _ *slog.Logger) (Inbound, error) {
+	return nil, ErrUnsupported
+}

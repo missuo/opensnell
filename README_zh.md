@@ -41,6 +41,7 @@ HTTP/3 加速，请将 OpenSnell 服务端搭配 **Surge** 客户端，或任何
 | TCP Fast Open（仅 Linux）             | ✅             | ✅             |
 | **QUIC 代理模式（v5）**               | ✅             | 使用 Surge     |
 | **`tcp-brutal` 拥塞控制（实验性，仅 Linux）** | ✅     | ✅             |
+| **TUN 入站（实验性，仅 Linux）**      | —              | ✅             |
 
 ## 安装
 
@@ -246,6 +247,62 @@ brutal-cwnd-gain = 15     ; 可选；以十分之一为单位
 ./snell-client -c snell-client.conf       # info 级别日志
 ./snell-client -c snell-client.conf -v    # debug 级别日志
 ```
+
+### 实验性：TUN 入站（仅 Linux）
+
+除了本地 SOCKS5 监听之外，`snell-client` 还可以接管一张 TUN 网卡作为
+系统默认路由，让机器上 *所有* 进程都透明地通过 snell 服务器出网 —
+不需要应用本身懂 SOCKS5。这与 Clash / sing-box 的 tun-inbound 形态
+一致，底层使用 [sagernet/sing-tun](https://github.com/SagerNet/sing-tun)
+的 `system` 用户态 stack（不需要 `with_gvisor` 构建 tag）。
+
+要求与注意事项：
+
+- **仅 Linux**（依赖 `/dev/net/tun`、`ip route`、`ip rule`）。其他平台
+  仍可编译同一份二进制，但 `--tun` 会直接返回不支持错误。
+- **需要 `CAP_NET_ADMIN`**（实际操作上：以 root 运行，或通过 systemd
+  `AmbientCapabilities` 授权）。**只用 SOCKS5 模式时仍然不需要 root。**
+- **DNS 透传，线路上仅有 IP。** 主机发起的 DNS 查询会以 UDP 形式通过
+  TUN 出去，内核侧先做本地名字解析，最终送到 snell 服务器的是解析后
+  的 IP。也就是说当前实现下 snell 以 `AtypIPv4`/`AtypIPv6` 编码目的地，
+  而不是 `AtypDomainName`；未来可能加入 fake-IP DNS 来保留原始域名。
+- **服务器 IP 会被自动从 TUN 默认路由中排除**，避免 `snell-client` 到
+  snell 服务器的出向 TCP 自身回环。如果 `server = host:port` 是域名，
+  会在启动时解析一次并锁定到 IP，进程生命周期内不再重新解析。
+
+在原有 `[snell-client]` 之外加一个 `[snell-tun]` 段：
+
+```ini
+[snell-tun]
+
+; 总开关。默认 false — 不写或为 false 时 snell-client 行为与历史一致
+; （SOCKS5-only）。也可以用命令行 --tun 强制开启。
+enable = true
+
+; TUN 接口名。留空时自动取下一个空闲的 tunN。
+interface = tun0
+
+; TUN 自身的 IPv4 地址 + 子网。默认 198.18.0.1/16，避开常见 RFC1918 段。
+address = 198.18.0.1/16
+
+; MTU。默认 9000（与 sing-tun system stack 友好）。
+mtu = 9000
+
+; 自动安装 ip route / ip rule，把流量导入 TUN。如果你想自己接管路由表
+; （比如自定义规则、fwmark、分流），设为 false，再用你自己的规则把
+; 目标流量导入这张网卡。默认 true。
+auto-route = true
+```
+
+可以保留 `[snell-client]` 的 `listen = 127.0.0.1:1080` 让 SOCKS5 与 TUN
+同时运行，也可以把它改成 `listen = off` 跑纯 TUN 模式。
+
+```sh
+sudo ./snell-client --tun -c snell-client.conf
+```
+
+v1 暂未实现（已列入后续计划）：fake-IP DNS 以保留域名信息；TUN 内 IPv6；
+macOS 与 Windows。
 
 ### 端到端冒烟测试示例
 
