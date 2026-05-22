@@ -56,8 +56,8 @@ import (
 // Matches sing-tun's DefaultAutoRedirectOutputMark (0x2024).
 const DefaultOutputMark uint32 = 0x2024
 
-// DefaultFakeIPPrefix is the synthetic IP pool's address range. Chosen
-// to be inside RFC 2544's `198.18.0.0/15` benchmark-reserved space
+// DefaultFakeIPPrefix is the IPv4 synthetic-IP pool's address range.
+// Chosen inside RFC 2544's `198.18.0.0/15` benchmark-reserved space
 // (so it never escapes to the public internet) but avoiding the
 // `198.18.0.0/16` and `198.18.0.0/15` defaults of clash and sing-box
 // — both of which take the lower half of 2544 — so opensnell's TUN
@@ -66,24 +66,49 @@ var DefaultFakeIPPrefix = netip.MustParsePrefix("198.18.128.0/17")
 
 // Config configures the TUN inbound.
 type Config struct {
-	// FakeIPPrefix is the CIDR fake-IP addresses are allocated from.
-	// Defaults to DefaultFakeIPPrefix. Must be IPv4 and large enough
-	// to hold a reasonable mapping cache (recommend /20 or larger).
+	// FakeIPPrefix is the IPv4 CIDR fake-IP addresses are allocated
+	// from. Defaults to DefaultFakeIPPrefix. Must be IPv4 and large
+	// enough to hold a reasonable mapping cache (recommend /20 or
+	// larger).
+	//
+	// IPv4 only by design: snell servers are almost universally v4
+	// reachable, and forcing all proxied traffic through v4 sidesteps
+	// the case where a v6-capable host's DNS path bypasses our
+	// fake-IP layer and hands the app a real v6 address that the v4-
+	// only snell server can't reach. AAAA queries get an empty
+	// NOERROR reply so resolvers fall back to A.
 	FakeIPPrefix netip.Prefix
 
-	// TUNName is the kernel interface name. Empty picks "snell0".
+	// TUNName is the kernel interface name. Empty picks "snell0" on
+	// Linux; on macOS the name must be "utunN" and is auto-picked
+	// when empty.
 	TUNName string
 
-	// MTU defaults to 9000.
+	// MTU defaults to 9000 on Linux, 1500 on macOS (utun on macOS
+	// caps at the system MTU minus a small overhead — keeping it at
+	// 1500 avoids fragmentation surprises).
 	MTU uint32
+
+	// ServerIPs are the resolved IPv4 addresses of the snell server.
+	// Used on macOS as Inet4RouteExcludeAddress so the auto-routed
+	// TUN does not capture our own outbound connection to the snell
+	// server (which would loop). Ignored on Linux (SO_MARK on the
+	// snell-client dialer handles the bypass instead).
+	//
+	// main() is expected to resolve once at startup and ALSO pin the
+	// resolved IP into ClientConfig.Server so subsequent re-resolves
+	// (which would hit our fake-IP DNS once TUN is up) don't loop.
+	ServerIPs []netip.Addr
 
 	// ExcludeUIDs lists Linux UIDs whose outbound TCP should NOT be
 	// redirected. Typical use: transparent forwarders (realm, gost)
-	// running as their own non-root user.
+	// running as their own non-root user. Ignored on macOS (no
+	// equivalent kernel hook).
 	ExcludeUIDs []uint32
 
 	// OutputMark is the SO_MARK snell-client sets on its own outbound
-	// sockets so nftables can bypass them. Defaults to DefaultOutputMark.
+	// sockets so nftables can bypass them on Linux. Defaults to
+	// DefaultOutputMark. Ignored on macOS.
 	OutputMark uint32
 }
 

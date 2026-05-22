@@ -25,31 +25,228 @@ import (
 // per HTTP request.
 const fakeIPTTL = 60
 
-// dnsServer is the tiny UDP-only DNS responder that hands out fake-IP
-// answers from a FakePool. It listens on a single (IP, 53) pair —
-// typically the TUN gateway address — and handles A / AAAA queries
-// in-process. Everything else returns SERVFAIL.
+// FakePools bundles the per-family fake-IP pools used by the DNS
+// responder. The v6 pool may be nil when the host has no IPv6
+// fake-IP coverage configured — AAAA queries then get an empty
+// answer and the app falls back to A.
+type FakePools struct {
+	V4 *FakePool
+	V6 *FakePool // may be nil
+}
+
+// Lookup walks both pools to recover the hostname for ip. The IPv4
+// pool is tried first because v4 reverse-lookups are the common case
+// (TCP destinations the TUN catches are usually v4).
+func (p *FakePools) Lookup(ip netip.Addr) (string, bool) {
+	if p == nil {
+		return "", false
+	}
+	if p.V4 != nil && p.V4.Contains(ip) {
+		return p.V4.Lookup(ip)
+	}
+	if p.V6 != nil && p.V6.Contains(ip) {
+		return p.V6.Lookup(ip)
+	}
+	return "", false
+}
+
+// Contains reports whether ip falls inside any of the configured
+// pools' prefixes.
+func (p *FakePools) Contains(ip netip.Addr) bool {
+	if p == nil {
+		return false
+	}
+	if p.V4 != nil && p.V4.Contains(ip) {
+		return true
+	}
+	if p.V6 != nil && p.V6.Contains(ip) {
+		return true
+	}
+	return false
+}
+
+// ServeDNSQuery is the platform-neutral DNS query handler. Given raw
+// DNS message bytes, it returns the bytes of the response to send
+// back. ok=false means "no usable reply to send" (parse failure with
+// no recoverable ID, etc.) — caller should drop the packet without
+// writing anything.
 //
-// We deliberately do not forward to an upstream resolver for non-A/
-// AAAA queries. The whole point of the TUN inbound is "don't trust
-// the host's DNS path", so forwarding MX/TXT/SOA/PTR to a possibly
-// poisoned resolver would defeat the purpose. Apps that need those
-// record types in TUN mode would need a v2 design with an in-snell
-// upstream forwarder.
+// Behavior:
+//
+//   * A queries     → fake-IPv4 from pools.V4 (if configured), else SERVFAIL
+//   * AAAA queries  → fake-IPv6 from pools.V6 (if configured), else NOERROR
+//                     with no answers (so apps fall back to A)
+//   * Everything else → SERVFAIL (we deliberately do NOT forward
+//     MX/TXT/SOA/PTR/SRV to any upstream — the whole point of TUN
+//     mode is to not trust the host's DNS path; forwarding to a
+//     possibly poisoned upstream would defeat that)
+//
+// Used by both the Linux UDP server (which listens on the TUN
+// gateway address) and the macOS PacketConn intercept (which catches
+// every UDP-port-53 flow that the TUN system-stack delivers).
+func ServeDNSQuery(query []byte, pools *FakePools, log *slog.Logger) (response []byte, ok bool) {
+	var p dnsmessage.Parser
+	hdr, err := p.Start(query)
+	if err != nil {
+		log.Debug("dns parse header", "err", err)
+		return nil, false
+	}
+	if hdr.Response {
+		return nil, false
+	}
+	q, err := p.Question()
+	if err != nil {
+		log.Debug("dns parse question", "err", err)
+		resp, err := buildFailure(hdr.ID, dnsmessage.RCodeFormatError)
+		return resp, err == nil
+	}
+	switch q.Type {
+	case dnsmessage.TypeA:
+		if pools == nil || pools.V4 == nil {
+			resp, err := buildFailure(hdr.ID, dnsmessage.RCodeServerFailure)
+			return resp, err == nil
+		}
+		resp, err := buildAReply(hdr.ID, q, pools.V4, log)
+		return resp, err == nil
+	case dnsmessage.TypeAAAA:
+		if pools == nil || pools.V6 == nil {
+			// No v6 fake-IP pool: return NOERROR with no answers so
+			// the resolver falls back to A.
+			resp, err := buildEmpty(hdr.ID, q)
+			return resp, err == nil
+		}
+		resp, err := buildAAAAReply(hdr.ID, q, pools.V6, log)
+		return resp, err == nil
+	default:
+		resp, err := buildFailure(hdr.ID, dnsmessage.RCodeServerFailure)
+		return resp, err == nil
+	}
+}
+
+func buildAReply(id uint16, q dnsmessage.Question, pool *FakePool, log *slog.Logger) ([]byte, error) {
+	host := q.Name.String()
+	ip, err := pool.Allocate(host)
+	if err != nil {
+		log.Warn("dns: fake-ip v4 pool allocate failed", "host", host, "err", err)
+		return buildFailure(id, dnsmessage.RCodeServerFailure)
+	}
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
+		ID:                 id,
+		Response:           true,
+		Authoritative:      true,
+		RecursionDesired:   true,
+		RecursionAvailable: true,
+		RCode:              dnsmessage.RCodeSuccess,
+	})
+	b.EnableCompression()
+	if err := b.StartQuestions(); err != nil {
+		return nil, err
+	}
+	if err := b.Question(q); err != nil {
+		return nil, err
+	}
+	if err := b.StartAnswers(); err != nil {
+		return nil, err
+	}
+	if err := b.AResource(dnsmessage.ResourceHeader{
+		Name:  q.Name,
+		Type:  dnsmessage.TypeA,
+		Class: dnsmessage.ClassINET,
+		TTL:   fakeIPTTL,
+	}, dnsmessage.AResource{A: ip.As4()}); err != nil {
+		return nil, err
+	}
+	out, err := b.Finish()
+	if err != nil {
+		return nil, err
+	}
+	log.Debug("dns A", "q", host, "fake", ip.String(), "pool_size", pool.Len())
+	return out, nil
+}
+
+func buildAAAAReply(id uint16, q dnsmessage.Question, pool *FakePool, log *slog.Logger) ([]byte, error) {
+	host := q.Name.String()
+	ip, err := pool.Allocate(host)
+	if err != nil {
+		log.Warn("dns: fake-ip v6 pool allocate failed", "host", host, "err", err)
+		return buildFailure(id, dnsmessage.RCodeServerFailure)
+	}
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
+		ID:                 id,
+		Response:           true,
+		Authoritative:      true,
+		RecursionDesired:   true,
+		RecursionAvailable: true,
+		RCode:              dnsmessage.RCodeSuccess,
+	})
+	b.EnableCompression()
+	if err := b.StartQuestions(); err != nil {
+		return nil, err
+	}
+	if err := b.Question(q); err != nil {
+		return nil, err
+	}
+	if err := b.StartAnswers(); err != nil {
+		return nil, err
+	}
+	if err := b.AAAAResource(dnsmessage.ResourceHeader{
+		Name:  q.Name,
+		Type:  dnsmessage.TypeAAAA,
+		Class: dnsmessage.ClassINET,
+		TTL:   fakeIPTTL,
+	}, dnsmessage.AAAAResource{AAAA: ip.As16()}); err != nil {
+		return nil, err
+	}
+	out, err := b.Finish()
+	if err != nil {
+		return nil, err
+	}
+	log.Debug("dns AAAA", "q", host, "fake", ip.String(), "pool_size", pool.Len())
+	return out, nil
+}
+
+func buildEmpty(id uint16, q dnsmessage.Question) ([]byte, error) {
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
+		ID:            id,
+		Response:      true,
+		Authoritative: true,
+		RCode:         dnsmessage.RCodeSuccess,
+	})
+	b.EnableCompression()
+	_ = b.StartQuestions()
+	_ = b.Question(q)
+	_ = b.StartAnswers()
+	return b.Finish()
+}
+
+func buildFailure(id uint16, rcode dnsmessage.RCode) ([]byte, error) {
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
+		ID:       id,
+		Response: true,
+		RCode:    rcode,
+	})
+	return b.Finish()
+}
+
+// dnsServer is the tiny UDP-only DNS responder that hands out fake-IP
+// answers. It listens on a single (IP, 53) pair — typically the TUN
+// gateway address — and dispatches each query to ServeDNSQuery. Used
+// by the Linux TUN inbound; the macOS path inlines ServeDNSQuery
+// into the sing-tun UDP NAT callback instead.
 type dnsServer struct {
-	pool   *FakePool
+	pools  *FakePools
 	log    *slog.Logger
 	conn   *net.UDPConn
 	wg     sync.WaitGroup
 	closed atomic.Bool
 }
 
-func newDNSServer(addr netip.AddrPort, pool *FakePool, log *slog.Logger) (*dnsServer, error) {
+func newDNSServer(addr netip.AddrPort, pools *FakePools, log *slog.Logger) (*dnsServer, error) {
 	if !addr.IsValid() {
 		return nil, errors.New("dns: invalid listen address")
 	}
-	if pool == nil {
-		return nil, errors.New("dns: pool is required")
+	if pools == nil || pools.V4 == nil {
+		return nil, errors.New("dns: at least the v4 pool is required")
 	}
 	udpAddr := net.UDPAddrFromAddrPort(addr)
 	conn, err := net.ListenUDP("udp4", udpAddr)
@@ -57,9 +254,9 @@ func newDNSServer(addr netip.AddrPort, pool *FakePool, log *slog.Logger) (*dnsSe
 		return nil, fmt.Errorf("dns: listen %s: %w", addr, err)
 	}
 	return &dnsServer{
-		pool: pool,
-		log:  log,
-		conn: conn,
+		pools: pools,
+		log:   log,
+		conn:  conn,
 	}, nil
 }
 
@@ -94,123 +291,11 @@ func (s *dnsServer) loop(ctx context.Context) {
 }
 
 func (s *dnsServer) handle(query []byte, src netip.AddrPort) {
-	var p dnsmessage.Parser
-	hdr, err := p.Start(query)
-	if err != nil {
-		s.log.Debug("dns parse header", "src", src, "err", err)
+	resp, ok := ServeDNSQuery(query, s.pools, s.log)
+	if !ok || len(resp) == 0 {
 		return
 	}
-	if hdr.Response {
-		// We never expect to see responses on our listen socket.
-		return
-	}
-
-	// Read the question(s). DNS messages may carry several, but in
-	// practice both libc and Go's resolver ship a single one per
-	// message — we follow the same convention.
-	q, err := p.Question()
-	if err != nil {
-		s.log.Debug("dns parse question", "src", src, "err", err)
-		_ = s.replyFailure(hdr.ID, dnsmessage.RCodeFormatError, src)
-		return
-	}
-
-	host := q.Name.String()
-	switch q.Type {
-	case dnsmessage.TypeA:
-		s.replyA(hdr.ID, q, host, src)
-	case dnsmessage.TypeAAAA:
-		// IPv4-only for v1. Returning NOERROR with no answers is the
-		// canonical way to say "name exists, no record of this type";
-		// glibc/musl/go-resolver will then fall back to A.
-		s.replyEmpty(hdr.ID, q, src)
-	default:
-		// CNAME / MX / TXT / PTR / SOA / SRV / SVCB etc. — see the
-		// comment on dnsServer for why we don't forward these. Apps
-		// that strictly need them in TUN mode are not supported by
-		// v1.
-		_ = s.replyFailure(hdr.ID, dnsmessage.RCodeServerFailure, src)
-	}
-}
-
-func (s *dnsServer) replyA(id uint16, q dnsmessage.Question, host string, src netip.AddrPort) {
-	ip, err := s.pool.Allocate(host)
-	if err != nil {
-		s.log.Warn("dns: fake-ip pool allocate failed", "host", host, "err", err)
-		_ = s.replyFailure(id, dnsmessage.RCodeServerFailure, src)
-		return
-	}
-	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
-		ID:            id,
-		Response:      true,
-		OpCode:        0,
-		Authoritative: true,
-		RecursionDesired:   true,
-		RecursionAvailable: true,
-		RCode:         dnsmessage.RCodeSuccess,
-	})
-	b.EnableCompression()
-	if err := b.StartQuestions(); err != nil {
-		s.log.Debug("dns: build questions", "err", err)
-		return
-	}
-	if err := b.Question(q); err != nil {
-		s.log.Debug("dns: write question", "err", err)
-		return
-	}
-	if err := b.StartAnswers(); err != nil {
-		s.log.Debug("dns: start answers", "err", err)
-		return
-	}
-	if err := b.AResource(dnsmessage.ResourceHeader{
-		Name:  q.Name,
-		Type:  dnsmessage.TypeA,
-		Class: dnsmessage.ClassINET,
-		TTL:   fakeIPTTL,
-	}, dnsmessage.AResource{A: ip.As4()}); err != nil {
-		s.log.Debug("dns: write A", "err", err)
-		return
-	}
-	msg, err := b.Finish()
-	if err != nil {
-		s.log.Debug("dns: finish", "err", err)
-		return
-	}
-	if _, err := s.conn.WriteToUDPAddrPort(msg, src); err != nil {
+	if _, err := s.conn.WriteToUDPAddrPort(resp, src); err != nil {
 		s.log.Debug("dns: write reply", "err", err)
-		return
 	}
-	s.log.Debug("dns A", "q", host, "fake", ip.String(), "pool_size", s.pool.Len())
-}
-
-func (s *dnsServer) replyEmpty(id uint16, q dnsmessage.Question, src netip.AddrPort) {
-	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
-		ID:            id,
-		Response:      true,
-		Authoritative: true,
-		RCode:         dnsmessage.RCodeSuccess,
-	})
-	b.EnableCompression()
-	_ = b.StartQuestions()
-	_ = b.Question(q)
-	_ = b.StartAnswers()
-	msg, err := b.Finish()
-	if err != nil {
-		return
-	}
-	_, _ = s.conn.WriteToUDPAddrPort(msg, src)
-}
-
-func (s *dnsServer) replyFailure(id uint16, rcode dnsmessage.RCode, src netip.AddrPort) error {
-	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
-		ID:       id,
-		Response: true,
-		RCode:    rcode,
-	})
-	msg, err := b.Finish()
-	if err != nil {
-		return err
-	}
-	_, err = s.conn.WriteToUDPAddrPort(msg, src)
-	return err
 }

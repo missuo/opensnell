@@ -71,11 +71,12 @@ func New(ctx context.Context, cfg Config, dialer Dialer, log *slog.Logger) (Inbo
 		return nil, fmt.Errorf("snell-tun: fake-ip prefix %q must be IPv4", cfg.FakeIPPrefix)
 	}
 
-	pool, err := NewFakePool(cfg.FakeIPPrefix, 0)
+	pool4, err := NewFakePool(cfg.FakeIPPrefix, 0)
 	if err != nil {
 		return nil, fmt.Errorf("snell-tun: build fake-ip pool: %w", err)
 	}
-	gateway := pool.Gateway()
+	pools := &FakePools{V4: pool4} // V6 intentionally nil — see Config.FakeIPPrefix doc.
+	gateway := pool4.Gateway()
 	log.Info("snell tun fake-ip pool ready",
 		"prefix", cfg.FakeIPPrefix.String(),
 		"gateway", gateway.String(),
@@ -108,9 +109,8 @@ func New(ctx context.Context, cfg Config, dialer Dialer, log *slog.Logger) (Inbo
 		excludeUIDs = append(excludeUIDs, ranges.NewSingle(uid))
 	}
 
-	// TUN address: assign the gateway. e.g. 198.18.128.1 with the
-	// caller's prefix bits, so the kernel auto-routes the whole CIDR
-	// over the TUN.
+	// TUN address: assign the gateway with the prefix bits so the
+	// kernel auto-routes the whole fake-IP CIDR over the TUN.
 	tunPrefix := netip.PrefixFrom(gateway, cfg.FakeIPPrefix.Bits())
 
 	tunOpts := &singtun.Options{
@@ -121,8 +121,8 @@ func New(ctx context.Context, cfg Config, dialer Dialer, log *slog.Logger) (Inbo
 		AutoRedirectOutputMark: cfg.OutputMark,
 		ExcludeUID:             excludeUIDs,
 		// Hijack UDP/TCP :53 from apps and DNAT to our DNS server
-		// listening on the TUN gateway. (TCP hijack lands on a port we
-		// don't listen on — apps fall back to UDP, which is the common
+		// listening on the TUN gateway. (TCP hijack lands on a port
+		// we don't listen on — apps fall back to UDP, the common
 		// case.)
 		DNSServers:       []netip.Addr{gateway},
 		InterfaceFinder:  finder,
@@ -137,7 +137,7 @@ func New(ctx context.Context, cfg Config, dialer Dialer, log *slog.Logger) (Inbo
 		return nil, fmt.Errorf("snell-tun: create TUN device: %w", err)
 	}
 
-	h := &handler{ctx: ctx, dialer: dialer, log: log, pool: pool}
+	h := &handler{ctx: ctx, dialer: dialer, log: log, pools: pools}
 
 	stack, err := singtun.NewStack("system", singtun.StackOptions{
 		Context:         ctx,
@@ -168,7 +168,7 @@ func New(ctx context.Context, cfg Config, dialer Dialer, log *slog.Logger) (Inbo
 		return nil, fmt.Errorf("snell-tun: start TUN: %w", err)
 	}
 
-	dns, err := newDNSServer(netip.AddrPortFrom(gateway, 53), pool, log)
+	dns, err := newDNSServer(netip.AddrPortFrom(gateway, 53), pools, log)
 	if err != nil {
 		_ = device.Close()
 		_ = stack.Close()
@@ -182,7 +182,7 @@ func New(ctx context.Context, cfg Config, dialer Dialer, log *slog.Logger) (Inbo
 	// out of the OUTPUT REDIRECT rule, so TCP destined to fake-IPs
 	// flows through the TUN (where our handler reverse-looks up the
 	// hostname) instead of being DNAT'd to the userspace TCP listener
-	// (where it would only see the IP, not the hostname).
+	// (which would only see the IP, losing the hostname).
 	excludeIPSetBuilder := &netipx.IPSetBuilder{}
 	excludeIPSetBuilder.AddPrefix(cfg.FakeIPPrefix)
 	excludeIPSet, err := excludeIPSetBuilder.IPSet()
@@ -225,10 +225,10 @@ func New(ctx context.Context, cfg Config, dialer Dialer, log *slog.Logger) (Inbo
 		return nil, fmt.Errorf("snell-tun: start auto-redirect: %w", err)
 	}
 
-	log.Info("snell tun ready",
+	log.Info("snell tun ready (linux / auto-redirect)",
 		"iface", cfg.TUNName,
 		"gateway", gateway.String(),
-		"fake-ip-prefix", cfg.FakeIPPrefix.String(),
+		"prefix", cfg.FakeIPPrefix.String(),
 		"mtu", cfg.MTU,
 		"output-mark", fmt.Sprintf("0x%x", cfg.OutputMark),
 		"exclude-uids", cfg.ExcludeUIDs,
@@ -284,11 +284,14 @@ func (i *inbound) Close() error {
 // for everything else) to snell.Client. When destination falls inside
 // the fake-IP pool's prefix, we reverse-lookup the original hostname so
 // the snell server gets AtypDomainName and does its own (clean) DNS.
+// Holds both v4 and v6 fake-IP pools so the same handler instance
+// serves both inbound paths (TUN system stack + AutoRedirect TCP
+// listener).
 type handler struct {
 	ctx    context.Context
 	dialer Dialer
 	log    *slog.Logger
-	pool   *FakePool
+	pools  *FakePools
 }
 
 // PrepareConnection — see comments in v1 implementation. Always defer
@@ -334,14 +337,14 @@ func (h *handler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 // resolveDest returns the snell-side (host, port) for a given
 // connection-arrival destination:
 //
-//  • Fake-IP destination (came from the TUN stack): pool lookup for
-//    the original hostname. ok=false if the IP is in the fake-IP
-//    prefix but unmapped.
+//  • Fake-IP destination (came from the TUN stack, either v4 or v6):
+//    pool lookup for the original hostname. ok=false if the IP is in
+//    a fake-IP prefix but unmapped.
 //  • Real IP destination (came from AutoRedirect): pass through.
 func (h *handler) resolveDest(dst M.Socksaddr) (host string, port uint16, ok bool) {
 	addr := dst.Addr.Unmap()
-	if h.pool.Contains(addr) {
-		name, found := h.pool.Lookup(addr)
+	if h.pools.Contains(addr) {
+		name, found := h.pools.Lookup(addr)
 		if !found {
 			return "", 0, false
 		}

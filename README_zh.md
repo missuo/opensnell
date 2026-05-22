@@ -41,7 +41,7 @@ HTTP/3 加速，请将 OpenSnell 服务端搭配 **Surge** 客户端，或任何
 | TCP Fast Open（仅 Linux）             | ✅             | ✅             |
 | **QUIC 代理模式（v5）**               | ✅             | 使用 Surge     |
 | **`tcp-brutal` 拥塞控制（实验性，仅 Linux）** | ✅     | ✅             |
-| **TUN 入站（实验性，仅 Linux）**      | —              | ✅             |
+| **TUN 入站 + fake-IP DNS（实验性，Linux + macOS）** | — | ✅       |
 
 ## 安装
 
@@ -248,12 +248,24 @@ brutal-cwnd-gain = 15     ; 可选；以十分之一为单位
 ./snell-client -c snell-client.conf -v    # debug 级别日志
 ```
 
-### 实验性：TUN 入站 — 透明 TCP 接管 + fake-IP DNS（仅 Linux）
+### 实验性：TUN 入站 — 透明 TCP 接管 + fake-IP DNS（Linux + macOS）
 
 除了 SOCKS5 监听之外，`snell-client` 还可以**透明地接管机器上所有
 新发起的出向 TCP 连接**并通过 snell 服务器转发——应用本身完全不需要
 懂 SOCKS5，而且**域名信息端到端保留**，由 snell 服务器自己做（干净的）
 DNS 解析。
+
+**纯 IPv4 设计**：两个平台都只走 v4 fake-IP。AAAA 查询返回空
+NOERROR，让解析器 fallback 到 A 记录；snell 服务器再用自己的 DNS
+拿 v4 IP 连接。这样规避了 v6 capable 主机的 DNS 路径绕过 fake-IP
+层、或者 snell 服务器无 v6 出口的边缘场景。
+
+底层机制因为内核 hook 能力不同两个平台有差别，但对用户行为一致：
+
+| 平台 | TCP 接管 | DNS 接管 | 原因 |
+|------|---------|----------|------|
+| Linux | `nftables` REDIRECT + fake-IP TUN | `nftables` 把 UDP/TCP :53 DNAT 到 TUN 网关 DNS server | nftables 存在，能保留入站服务 + 用 SO_MARK 旁路 snell-client 自身出向 |
+| macOS | TUN auto-route 把整个 v4 接管（8 条 sub-prefix 路由 1/8 … 128/1，server IP 排除）| 启动时**自动改系统 DNS**到 TUN 网关 IP，退出时恢复 | macOS 没有 sing-tun 支持的 netfilter 等价物；且 macOS scoped routing 让 mDNSResponder 把 DNS 包绑到 Wi-Fi 源接口送出，单纯默认路由劫持挡不住——必须改系统 DNS 配置才能强制走 TUN |
 
 底层是 **fake-IP DNS 劫持 + nftables REDIRECT** 双轨架构，跟
 clash / mihomo / sing-box 一致：
@@ -292,29 +304,41 @@ IP 目标」（直接连 IP 不走域名的应用）。两条入站共用一个 
 
 | 流量                                                | 行为 |
 | --------------------------------------------------- | ---- |
-| 进站 TCP/UDP 到本机服务（sshd / nginx / caddy / realm…） | **不动**——`PREROUTING` 把目标为本机的 IP 全部放行 |
-| 上述服务对外的回包                                   | **不动**——`ct mark` 在 conntrack 上跳过 redirect |
+| 进站 TCP/UDP 到本机服务（sshd / nginx / caddy / realm…） | **Linux: 不动**（`PREROUTING` 放行目标本机的 IP）。**macOS: 工作站场景不动**——见下方 macOS 注意事项 |
+| 上述服务对外的回包                                   | **Linux: 不动**（`ct mark` 在 conntrack 上跳过 redirect）。**macOS: 同上注意事项** |
 | 本机进程出向 TCP（按域名）                           | **fake-IP 接管** → snell 用 `AtypDomainName` |
-| 本机进程出向 TCP（直接 IP）                          | **REDIRECT 接管** → snell 用 `AtypIPv4` |
-| `snell-client` 自己连向 snell 服务器的 TCP           | **不动**——`SO_MARK` 0x2024 在 OUTPUT 链命中并提前返回 |
-| 本机进程的 UDP（DNS 以外）                           | **不动**——v2 只接管 DNS，其它 UDP 直连 |
-| 本机进程的 ICMP                                      | **不动** |
-| `FORWARD` 链路由转发（容器、`ip_forward=1`）         | **不动**——我们不动 FORWARD 链 |
+| 本机进程出向 TCP（直接 IP）                          | **接管**（Linux 走 REDIRECT，macOS 走 TUN 默认路由）→ snell 用 `AtypIPv4` |
+| `snell-client` 自己连向 snell 服务器的 TCP           | **Linux: 不动**（`SO_MARK` 0x2024 在 OUTPUT 链命中提前返回）。**macOS: 不动**（server IP 作为 `Inet4RouteExcludeAddress`，内核根本不走 TUN）|
+| AAAA DNS 查询                                       | 返回空 NOERROR（应用 fallback 到 A），无 v6 fake-IP 路径 |
+| 本机进程 IPv6 出向                                   | **不接管** — TUN 只接管 v4；已经持有真 v6 地址的应用（IP 字面量、缓存）如有 v6 出口会自己走，绕开 snell |
+| 本机进程的 UDP（DNS 以外）                           | **Linux: 不动**（只接管 DNS）。**macOS: 丢弃**（TUN 接住所有 v4 UDP，v2 只处理 DNS）|
+| 本机进程的 ICMP                                      | **Linux: 不动。** **macOS: 丢弃** |
+| `FORWARD` 链路由转发（容器、`ip_forward=1`）         | **Linux: 不动**（我们不动 FORWARD 链）。**macOS: 不适用** |
 
-这意味着：任意来源 IP 发起的新 SSH 都能连进来；本机已有的 TCP 服务
+在 Linux 上，任意来源 IP 发起的新 SSH 都能连进来；本机已有 TCP 服务
 不受影响；`SIGTERM`/`SIGINT` 后 TUN 接口、nftables 表和 sing-tun
 那条优先级 1 的 `ip rule` 全部反卷，机器回到完全干净的状态。**端到端
 已验证**——包括在 ISP DNS 被污染的机器上 `docker pull` Docker Hub
 官方镜像成功。
 
+**macOS 注意事项**：macOS 没有 sing-tun 支持的 netfilter 等价物，
+所以是 auto-route 路径——TUN 通过 8 条 sub-prefix 抢占默认路由。
+这意味着 **macOS 上对外提供 inbound 服务的进程在 TUN 开启时回包会被
+拉进 TUN 转发给 snell，无法正常应答远端客户端**。典型的桌面用法
+（机器上没有任何对外公开端口）不会被影响。如果你在 Mac 上跑公开服务，
+关掉 TUN。另外因为程序会改系统 DNS，**进程异常崩溃没退出干净**时
+DNS 会留在 TUN 网关上，需要手动恢复（`sudo networksetup
+-setdnsservers "Wi-Fi" Empty`）或者跑提供的 cleanup 脚本。
+
 环境要求：
 
-- **仅 Linux**，内核加载 `nf_tables` + `nf_conntrack` 模块（Debian 12+
-  / RHEL 9+ 默认满足）。
-- **`nft` 命令在 `$PATH` 里**。
-- **需要 `CAP_NET_ADMIN`**（实际操作就是以 root 运行，或通过 systemd
-  `AmbientCapabilities` 授权）。**只用 SOCKS5 模式时仍然不需要 root**，
-  同一份二进制两种用法都行。
+- **Linux**：内核加载 `nf_tables` + `nf_conntrack` 模块（Debian 12+
+  / RHEL 9+ 默认满足），`nft` 命令在 `$PATH` 里，需要 `CAP_NET_ADMIN`
+  （以 root 运行，或通过 systemd `AmbientCapabilities` 授权）。
+- **macOS**：需要 `sudo` 来创建 utun 设备、安装路由、改写系统 DNS。
+  `networksetup` 是系统自带的。
+- 两个平台**只用 SOCKS5 模式时仍然不需要 root**，同一份二进制两种用法
+  都行。
 
 让特定的服务（`realm` / `gost` / `socat` 这类端口转发器）从重定向中
 旁路出去——这些工具的出向语义是「透明转发到远端目标」，你通常希望它们

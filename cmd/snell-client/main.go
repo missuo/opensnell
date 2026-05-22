@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
 	"os"
 	"os/signal"
@@ -69,13 +70,42 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// In TUN mode the snell client's own outbound to the snell server
-	// must be tagged with SO_MARK so the auto-redirect nftables rules
-	// can match it and bypass the redirect. Without this, the
-	// snell-client→snell-server connection would itself be captured by
-	// our own listener and loop.
+	// TUN-mode bypass for snell-client's own outbound to the snell
+	// server, both forms required:
+	//
+	//   1. SO_MARK 0x2024 on Linux — nftables OUTPUT chain matches the
+	//      mark and skips the auto-redirect, so the connection lands on
+	//      the real interface instead of our own listener.
+	//   2. Pinned server IP universally — when TUN is up our fake-IP
+	//      DNS server intercepts every UDP :53 outbound on Linux (via
+	//      nft DNAT) and every UDP packet on macOS (via the TUN system
+	//      stack). If `server = host:port` is a hostname, snell-client
+	//      would re-resolve it after TUN is up, get back a fake-IP,
+	//      and TCP-connect to that fake-IP — which routes via the TUN
+	//      and arrives at our handler, which would call DialTCP with
+	//      the hostname again, looping. Resolving once before TUN
+	//      starts and rewriting Server to ip:port form breaks the
+	//      cycle. On macOS the resolved IP is also installed as a
+	//      Inet4RouteExcludeAddress so the kernel doesn't even try to
+	//      route it through the TUN.
+	var tunServerIPs []netip.Addr
 	if cfg.tun.enable {
 		cfg.snellCfg.SocketMark = tun.DefaultOutputMark
+
+		ips, err := resolveServerIPs(ctx, cfg.snellCfg.Server)
+		if err != nil {
+			logger.Error("resolve snell server for tun mode", "server", cfg.snellCfg.Server, "err", err)
+			os.Exit(1)
+		}
+		if len(ips) == 0 {
+			logger.Error("snell server resolved to zero addresses", "server", cfg.snellCfg.Server)
+			os.Exit(1)
+		}
+		tunServerIPs = ips
+		if rewritten, ok := rewriteServerToIP(cfg.snellCfg.Server, ips[0]); ok {
+			logger.Info("tun mode: pinned snell server IP", "from", cfg.snellCfg.Server, "to", rewritten)
+			cfg.snellCfg.Server = rewritten
+		}
 	}
 
 	client, err := snell.NewClient(cfg.snellCfg, logger)
@@ -125,6 +155,7 @@ func main() {
 			TUNName:      cfg.tun.tunName,
 			MTU:          cfg.tun.mtu,
 			FakeIPPrefix: cfg.tun.fakeIPPrefix,
+			ServerIPs:    tunServerIPs,
 			ExcludeUIDs:  cfg.tun.excludeUIDs,
 			OutputMark:   tun.DefaultOutputMark,
 		}, client, logger)
@@ -147,6 +178,45 @@ func main() {
 		logger.Error("client exited", "err", firstEr)
 		os.Exit(1)
 	}
+}
+
+// resolveServerIPs converts "host:port" to a list of resolved IPs.
+// Called once before TUN starts, so the resolution happens through the
+// system's normal (TUN-free) path. Returns IPv4-first; IPv6 entries
+// are kept too but the TUN's auto-route exclusion (macOS) only sets
+// IPv4 today.
+func resolveServerIPs(ctx context.Context, server string) ([]netip.Addr, error) {
+	host, _, err := net.SplitHostPort(server)
+	if err != nil {
+		return nil, err
+	}
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return []netip.Addr{addr}, nil
+	}
+	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]netip.Addr, 0, len(addrs))
+	for _, a := range addrs {
+		out = append(out, a.Unmap())
+	}
+	return out, nil
+}
+
+// rewriteServerToIP returns ("ip:port", true) when host is a hostname,
+// or (server, false) when it's already an IP literal. Lets us pin the
+// resolved IP into ClientConfig.Server so the snell-client dialer
+// never re-resolves through the TUN's fake-IP DNS.
+func rewriteServerToIP(server string, ip netip.Addr) (string, bool) {
+	host, port, err := net.SplitHostPort(server)
+	if err != nil {
+		return server, false
+	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		return server, false
+	}
+	return net.JoinHostPort(ip.String(), port), true
 }
 
 func socks5Enabled(listen string) bool {

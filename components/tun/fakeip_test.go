@@ -163,6 +163,127 @@ func TestFakePoolContains(t *testing.T) {
 	}
 }
 
+// IPv6 pool — same semantics as IPv4 but the prefix is v6.
+func TestFakePoolIPv6Stable(t *testing.T) {
+	pool, err := NewFakePool(mustParsePrefix(t, "fdee::/96"), 0)
+	if err != nil {
+		t.Fatalf("new v6 pool: %v", err)
+	}
+	a, err := pool.Allocate("example.com")
+	if err != nil {
+		t.Fatalf("v6 allocate: %v", err)
+	}
+	if !a.Is6() || a.Is4() {
+		t.Errorf("expected v6 addr, got %v (Is6=%v Is4=%v)", a, a.Is6(), a.Is4())
+	}
+	if !pool.Contains(a) {
+		t.Errorf("allocated v6 %v not in v6 prefix", a)
+	}
+	b, _ := pool.Allocate("example.com")
+	if a != b {
+		t.Errorf("v6 stable mapping broken: %v vs %v", a, b)
+	}
+	host, ok := pool.Lookup(a)
+	if !ok || host != "example.com" {
+		t.Errorf("v6 reverse lookup: ok=%v host=%q", ok, host)
+	}
+}
+
+func TestFakePoolIPv6Gateway(t *testing.T) {
+	pool, _ := NewFakePool(mustParsePrefix(t, "fdee::/96"), 0)
+	want := netip.MustParseAddr("fdee::1")
+	if pool.Gateway() != want {
+		t.Errorf("v6 gateway = %v, want %v", pool.Gateway(), want)
+	}
+}
+
+func TestFakePoolIPv6SequentialAllocation(t *testing.T) {
+	pool, _ := NewFakePool(mustParsePrefix(t, "fdee::/96"), 0)
+	first, _ := pool.Allocate("a.example")
+	second, _ := pool.Allocate("b.example")
+	if first == second {
+		t.Errorf("expected distinct v6 IPs, both got %v", first)
+	}
+	// Two sequential allocations should differ by exactly 1.
+	if addrAdd(first, 1) != second {
+		t.Errorf("v6 not sequential: %v then %v", first, second)
+	}
+}
+
+func TestAddrArithmeticIPv4(t *testing.T) {
+	cases := []struct {
+		from, want string
+		n          uint32
+		op         string
+	}{
+		{"198.18.128.0", "198.18.128.16", 16, "add"},
+		{"198.18.128.16", "198.18.128.0", 16, "sub"},
+		{"0.0.0.255", "0.0.1.0", 1, "add"}, // carry across byte boundary
+		{"0.0.1.0", "0.0.0.255", 1, "sub"},
+	}
+	for _, c := range cases {
+		a := netip.MustParseAddr(c.from)
+		var got netip.Addr
+		if c.op == "add" {
+			got = addrAdd(a, c.n)
+		} else {
+			got = addrSub(a, c.n)
+		}
+		if got.String() != c.want {
+			t.Errorf("%s(%s, %d) = %s, want %s", c.op, c.from, c.n, got, c.want)
+		}
+	}
+}
+
+func TestAddrArithmeticIPv6(t *testing.T) {
+	cases := []struct {
+		from, want string
+		n          uint32
+		op         string
+	}{
+		{"fdee::", "fdee::10", 16, "add"},
+		{"fdee::10", "fdee::", 16, "sub"},
+		{"fdee::ff", "fdee::100", 1, "add"},     // carry across byte
+		{"fdee::100", "fdee::ff", 1, "sub"},
+		{"fdee::ffff", "fdee::1:0", 1, "add"},   // carry into the next 16-bit group
+		{"fdee::1:0", "fdee::ffff", 1, "sub"},
+	}
+	for _, c := range cases {
+		a := netip.MustParseAddr(c.from)
+		var got netip.Addr
+		if c.op == "add" {
+			got = addrAdd(a, c.n)
+		} else {
+			got = addrSub(a, c.n)
+		}
+		want := netip.MustParseAddr(c.want)
+		if got != want {
+			t.Errorf("%s(%s, %d) = %s, want %s", c.op, c.from, c.n, got, want)
+		}
+	}
+}
+
+func TestLastInPrefix(t *testing.T) {
+	cases := []struct {
+		prefix, want string
+	}{
+		{"198.18.128.0/17", "198.18.255.255"},
+		{"198.18.128.0/24", "198.18.128.255"},
+		{"10.0.0.0/8", "10.255.255.255"},
+		{"fdee::/96", "fdee::ffff:ffff"},
+		{"fdee::/112", "fdee::ffff"},
+		{"fd00::/8", "fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"},
+	}
+	for _, c := range cases {
+		p := netip.MustParsePrefix(c.prefix)
+		want := netip.MustParseAddr(c.want)
+		got := lastInPrefix(p)
+		if got != want {
+			t.Errorf("lastInPrefix(%s) = %s, want %s", c.prefix, got, want)
+		}
+	}
+}
+
 // rough sanity check: allocating a large number of hosts must not
 // outrun the prefix size + headroom.
 func TestFakePoolDoesNotOverrunPrefix(t *testing.T) {
