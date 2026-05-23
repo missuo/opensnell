@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"gopkg.in/ini.v1"
 
@@ -38,6 +39,14 @@ type tunFileConfig struct {
 	mtu          uint32
 	fakeIPPrefix netip.Prefix
 	excludeUIDs  []uint32
+
+	disableIPv6       bool
+	ipv6ProbeTarget   string
+	ipv6ProbeInterval time.Duration
+
+	directIPs     []netip.Prefix
+	directDomains []string
+	upstreamDNS   string
 }
 
 func main() {
@@ -152,12 +161,18 @@ func main() {
 
 	if cfg.tun.enable {
 		inbound, err := tun.New(ctx, tun.Config{
-			TUNName:      cfg.tun.tunName,
-			MTU:          cfg.tun.mtu,
-			FakeIPPrefix: cfg.tun.fakeIPPrefix,
-			ServerIPs:    tunServerIPs,
-			ExcludeUIDs:  cfg.tun.excludeUIDs,
-			OutputMark:   tun.DefaultOutputMark,
+			TUNName:           cfg.tun.tunName,
+			MTU:               cfg.tun.mtu,
+			FakeIPPrefix:      cfg.tun.fakeIPPrefix,
+			ServerIPs:         tunServerIPs,
+			ExcludeUIDs:       cfg.tun.excludeUIDs,
+			OutputMark:        tun.DefaultOutputMark,
+			DisableIPv6:       cfg.tun.disableIPv6,
+			IPv6ProbeTarget:   cfg.tun.ipv6ProbeTarget,
+			IPv6ProbeInterval: cfg.tun.ipv6ProbeInterval,
+			DirectIPs:         cfg.tun.directIPs,
+			DirectDomains:     cfg.tun.directDomains,
+			UpstreamDNS:       cfg.tun.upstreamDNS,
 		}, client, logger)
 		if err != nil {
 			recordErr(fmt.Errorf("tun: %w", err))
@@ -295,15 +310,94 @@ func loadClientConfig(path string) (clientFileConfig, error) {
 				return clientFileConfig{}, fmt.Errorf("[snell-tun] fake-ip-range %q: %w", rawPrefix, err)
 			}
 		}
+		directIPs, err := parsePrefixList(tunSec.Key("direct-ip").MustString(""))
+		if err != nil {
+			return clientFileConfig{}, fmt.Errorf("[snell-tun] direct-ip: %w", err)
+		}
+		directDomains := splitCSV(tunSec.Key("direct-domain").MustString(""))
+		// IPv6 config: the ini key "ipv6" is a positive enable
+		// switch matching how Mihomo/Clash express it. Internally we
+		// store the inverse (DisableIPv6) to keep the zero-value
+		// path mean "enabled by default with probe".
+		ipv6Enabled := tunSec.Key("ipv6").MustBool(true)
+
+		// Probe interval accepts Go duration strings ("5m", "30s").
+		// 0 / empty leaves the default in place.
+		var probeInterval time.Duration
+		if rawInt := strings.TrimSpace(tunSec.Key("ipv6-probe-interval").MustString("")); rawInt != "" {
+			probeInterval, err = time.ParseDuration(rawInt)
+			if err != nil {
+				return clientFileConfig{}, fmt.Errorf("[snell-tun] ipv6-probe-interval %q: %w", rawInt, err)
+			}
+		}
+
 		out.tun = tunFileConfig{
-			enable:       tunSec.Key("enable").MustBool(false),
-			tunName:      tunSec.Key("interface").MustString(""),
-			mtu:          uint32(tunSec.Key("mtu").MustInt(0)),
-			fakeIPPrefix: fakeIPPrefix,
-			excludeUIDs:  uids,
+			enable:            tunSec.Key("enable").MustBool(false),
+			tunName:           tunSec.Key("interface").MustString(""),
+			mtu:               uint32(tunSec.Key("mtu").MustInt(0)),
+			fakeIPPrefix:      fakeIPPrefix,
+			excludeUIDs:       uids,
+			disableIPv6:       !ipv6Enabled,
+			ipv6ProbeTarget:   strings.TrimSpace(tunSec.Key("ipv6-probe-target").MustString("")),
+			ipv6ProbeInterval: probeInterval,
+			directIPs:         directIPs,
+			directDomains:     directDomains,
+			upstreamDNS:       strings.TrimSpace(tunSec.Key("upstream-dns").MustString("")),
 		}
 	}
 
+	return out, nil
+}
+
+// splitCSV is the canonical "comma-separated list of strings" parser
+// for the snell-client config. Trims whitespace and drops empties.
+// Used for both direct-domain and any future CSV fields.
+func splitCSV(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// parsePrefixList parses "a.b.c.d/m, e.f.g.h/n" — a comma-separated
+// list of CIDRs — into netip.Prefix. Bare IP literals are accepted
+// and treated as /32 or /128.
+func parsePrefixList(raw string) ([]netip.Prefix, error) {
+	items := splitCSV(raw)
+	if len(items) == 0 {
+		return nil, nil
+	}
+	out := make([]netip.Prefix, 0, len(items))
+	for _, s := range items {
+		if strings.Contains(s, "/") {
+			p, err := netip.ParsePrefix(s)
+			if err != nil {
+				return nil, fmt.Errorf("%q: %w", s, err)
+			}
+			out = append(out, p)
+			continue
+		}
+		addr, err := netip.ParseAddr(s)
+		if err != nil {
+			return nil, fmt.Errorf("%q: %w", s, err)
+		}
+		bits := 32
+		if addr.Is6() {
+			bits = 128
+		}
+		out = append(out, netip.PrefixFrom(addr, bits))
+	}
 	return out, nil
 }
 

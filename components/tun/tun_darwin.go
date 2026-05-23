@@ -144,11 +144,22 @@ func New(ctx context.Context, cfg Config, dialer Dialer, log *slog.Logger) (Inbo
 		return nil, fmt.Errorf("snell-tun: create utun device: %w", err)
 	}
 
+	var prober *ipv6Prober
+	if !cfg.DisableIPv6 {
+		prober, err = newIPv6Prober(dialer, cfg.IPv6ProbeTarget, cfg.IPv6ProbeInterval, log)
+		if err != nil {
+			_ = ifMon.Close()
+			_ = netMon.Close()
+			return nil, fmt.Errorf("snell-tun: ipv6 prober: %w", err)
+		}
+	}
+
 	h := &darwinHandler{
 		ctx:    ctx,
 		dialer: dialer,
 		log:    log,
 		pools:  pools,
+		ipv6:   prober,
 	}
 
 	stack, err := singtun.NewStack("system", singtun.StackOptions{
@@ -177,6 +188,10 @@ func New(ctx context.Context, cfg Config, dialer Dialer, log *slog.Logger) (Inbo
 		_ = ifMon.Close()
 		_ = netMon.Close()
 		return nil, fmt.Errorf("snell-tun: start utun: %w", err)
+	}
+
+	if prober != nil {
+		prober.Start(ctx)
 	}
 
 	// Override the host's system DNS to point at our gateway. macOS's
@@ -211,6 +226,7 @@ func New(ctx context.Context, cfg Config, dialer Dialer, log *slog.Logger) (Inbo
 		ifMon:      ifMon,
 		netMon:     netMon,
 		dnsBackups: dnsBackups,
+		prober:     prober,
 		log:        log,
 	}, nil
 }
@@ -222,6 +238,7 @@ type darwinInbound struct {
 	ifMon      singtun.DefaultInterfaceMonitor
 	netMon     singtun.NetworkUpdateMonitor
 	dnsBackups []dnsBackup
+	prober     *ipv6Prober
 	log        *slog.Logger
 }
 
@@ -247,6 +264,7 @@ func (i *darwinInbound) Close() error {
 		rec(i.stack.Close())
 		rec(i.ifMon.Close())
 		rec(i.netMon.Close())
+		i.prober.Close()
 		i.log.Info("snell tun closed")
 	})
 	return firstErr
@@ -261,6 +279,10 @@ type darwinHandler struct {
 	dialer Dialer
 	log    *slog.Logger
 	pools  *FakePools
+	// ipv6 gates real (non-fake-IP) v6 destinations on the runtime
+	// probe of server v6 reachability. Nil iff config disabled v6.
+	// See handler.shouldDropV6 in tun_linux.go for the rationale.
+	ipv6 *ipv6Prober
 }
 
 // PrepareConnection — defer everything to NewConnectionEx /
@@ -291,6 +313,12 @@ func (h *darwinHandler) NewConnectionEx(ctx context.Context, conn net.Conn, sour
 		return
 	}
 
+	if h.shouldDropV6(destination) {
+		h.log.Debug("tun tcp: drop real ipv6 (server v6 path not available)",
+			"dst", destination.String(), "src", source.String())
+		return
+	}
+
 	host, port, ok := h.resolveDest(destination)
 	if !ok {
 		h.log.Debug("tun tcp: unknown fake-ip", "dst", destination.String(), "src", source.String())
@@ -305,6 +333,23 @@ func (h *darwinHandler) NewConnectionEx(ctx context.Context, conn net.Conn, sour
 	defer upstream.Close()
 	h.log.Debug("tun tcp", "src", source.String(), "dst-orig", destination.String(), "dst-real", host)
 	utils.Relay(conn, upstream)
+}
+
+// shouldDropV6 mirrors handler.shouldDropV6 in tun_linux.go — see
+// that comment. Lives in this file because darwinHandler is a
+// separate type.
+func (h *darwinHandler) shouldDropV6(dst M.Socksaddr) bool {
+	addr := dst.Addr.Unmap()
+	if !addr.IsValid() || addr.Is4() {
+		return false
+	}
+	if h.pools.Contains(addr) {
+		return false
+	}
+	if h.ipv6 == nil {
+		return true
+	}
+	return !h.ipv6.Allowed()
 }
 
 // resolveDest returns the snell-side (host, port) tuple:
@@ -356,7 +401,9 @@ func (h *darwinHandler) NewPacketConnectionEx(ctx context.Context, conn N.Packet
 		}
 		_ = dnsDst // not used: every packet on this flow targets `destination`
 
-		resp, ok := ServeDNSQuery(buffer.Bytes(), h.pools, h.log)
+		// direct=nil on darwin until the BypassManager macOS impl
+		// lands (route-add / pfctl via privileged helper).
+		resp, ok := ServeDNSQuery(buffer.Bytes(), h.pools, nil, h.log)
 		buffer.Release()
 		if !ok || len(resp) == 0 {
 			continue

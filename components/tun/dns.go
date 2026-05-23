@@ -73,18 +73,25 @@ func (p *FakePools) Contains(ip netip.Addr) bool {
 //
 // Behavior:
 //
+//   * Question whose name matches a Direct Domain suffix (when direct
+//     is non-nil) → forwarded to the configured upstream resolver
+//     verbatim. The response is returned unmodified to the client,
+//     and any A/AAAA addresses are also registered with the bypass
+//     manager so subsequent TCP to those IPs skips the proxy.
 //   * A queries     → fake-IPv4 from pools.V4 (if configured), else SERVFAIL
 //   * AAAA queries  → fake-IPv6 from pools.V6 (if configured), else NOERROR
 //                     with no answers (so apps fall back to A)
 //   * Everything else → SERVFAIL (we deliberately do NOT forward
 //     MX/TXT/SOA/PTR/SRV to any upstream — the whole point of TUN
 //     mode is to not trust the host's DNS path; forwarding to a
-//     possibly poisoned upstream would defeat that)
+//     possibly poisoned upstream would defeat that). The Direct
+//     Domain branch above is the one exception, scoped to names the
+//     user has explicitly opted into.
 //
 // Used by both the Linux UDP server (which listens on the TUN
 // gateway address) and the macOS PacketConn intercept (which catches
 // every UDP-port-53 flow that the TUN system-stack delivers).
-func ServeDNSQuery(query []byte, pools *FakePools, log *slog.Logger) (response []byte, ok bool) {
+func ServeDNSQuery(query []byte, pools *FakePools, direct *directDNS, log *slog.Logger) (response []byte, ok bool) {
 	var p dnsmessage.Parser
 	hdr, err := p.Start(query)
 	if err != nil {
@@ -98,6 +105,20 @@ func ServeDNSQuery(query []byte, pools *FakePools, log *slog.Logger) (response [
 	if err != nil {
 		log.Debug("dns parse question", "err", err)
 		resp, err := buildFailure(hdr.ID, dnsmessage.RCodeFormatError)
+		return resp, err == nil
+	}
+	// Direct Domain takes precedence over fake-IP for any query
+	// type, including AAAA. The user has explicitly listed this
+	// name to bypass the proxy, so they want the real records.
+	if direct.matches(q.Name.String()) {
+		if resp, ok := direct.handle(query); ok {
+			return resp, true
+		}
+		// Upstream failed — return SERVFAIL with the original ID so
+		// the client knows to retry; do NOT silently fall through to
+		// the fake-IP path (would lie to the user about a name they
+		// asked us to keep out of the proxy).
+		resp, err := buildFailure(hdr.ID, dnsmessage.RCodeServerFailure)
 		return resp, err == nil
 	}
 	switch q.Type {
@@ -229,19 +250,21 @@ func buildFailure(id uint16, rcode dnsmessage.RCode) ([]byte, error) {
 }
 
 // dnsServer is the tiny UDP-only DNS responder that hands out fake-IP
-// answers. It listens on a single (IP, 53) pair — typically the TUN
-// gateway address — and dispatches each query to ServeDNSQuery. Used
-// by the Linux TUN inbound; the macOS path inlines ServeDNSQuery
-// into the sing-tun UDP NAT callback instead.
+// answers (and, optionally, forwards Direct Domain queries upstream).
+// It listens on a single (IP, 53) pair — typically the TUN gateway
+// address — and dispatches each query to ServeDNSQuery. Used by the
+// Linux TUN inbound; the macOS path inlines ServeDNSQuery into the
+// sing-tun UDP NAT callback instead.
 type dnsServer struct {
 	pools  *FakePools
+	direct *directDNS // nil = no Direct Domain forwarding
 	log    *slog.Logger
 	conn   *net.UDPConn
 	wg     sync.WaitGroup
 	closed atomic.Bool
 }
 
-func newDNSServer(addr netip.AddrPort, pools *FakePools, log *slog.Logger) (*dnsServer, error) {
+func newDNSServer(addr netip.AddrPort, pools *FakePools, direct *directDNS, log *slog.Logger) (*dnsServer, error) {
 	if !addr.IsValid() {
 		return nil, errors.New("dns: invalid listen address")
 	}
@@ -254,9 +277,10 @@ func newDNSServer(addr netip.AddrPort, pools *FakePools, log *slog.Logger) (*dns
 		return nil, fmt.Errorf("dns: listen %s: %w", addr, err)
 	}
 	return &dnsServer{
-		pools: pools,
-		log:   log,
-		conn:  conn,
+		pools:  pools,
+		direct: direct,
+		log:    log,
+		conn:   conn,
 	}, nil
 }
 
@@ -291,7 +315,7 @@ func (s *dnsServer) loop(ctx context.Context) {
 }
 
 func (s *dnsServer) handle(query []byte, src netip.AddrPort) {
-	resp, ok := ServeDNSQuery(query, s.pools, s.log)
+	resp, ok := ServeDNSQuery(query, s.pools, s.direct, s.log)
 	if !ok || len(resp) == 0 {
 		return
 	}

@@ -49,6 +49,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"time"
 )
 
 // DefaultOutputMark is the fwmark snell-client stamps on its own
@@ -110,6 +111,49 @@ type Config struct {
 	// sockets so nftables can bypass them on Linux. Defaults to
 	// DefaultOutputMark. Ignored on macOS.
 	OutputMark uint32
+
+	// DisableIPv6 forces all IPv6 destination handling off, regardless
+	// of whether the snell server can actually reach v6. When false
+	// (the default), the TUN starts an in-tunnel probe that dials a
+	// known v6 target through snell; only when that probe succeeds
+	// does the handler accept real IPv6 destinations. AAAA queries on
+	// the fake-IP DNS path always return empty NOERROR (apps fall
+	// back to A) — the probe gate only affects raw v6 traffic that
+	// bypassed our DNS (e.g. DoH, literal v6 addresses, cached AAAA).
+	DisableIPv6 bool
+
+	// IPv6ProbeTarget overrides the v6 connectivity test endpoint. It
+	// must be a "[v6]:port" string. Empty uses the default
+	// ([2606:4700:4700::1111]:443, Cloudflare DNS).
+	IPv6ProbeTarget string
+
+	// IPv6ProbeInterval overrides how often the probe re-tests.
+	// Default 5 minutes. The first probe always runs synchronously
+	// during TUN start so handler decisions are correct from the very
+	// first packet.
+	IPv6ProbeInterval time.Duration
+
+	// DirectIPs lists CIDRs that should bypass the proxy entirely
+	// and use the host's normal routing. On Linux these are added to
+	// the AutoRedirect's RouteExcludeAddressSet so nftables stops
+	// REDIRECT-ing matching outbound TCP. Useful for LAN ranges,
+	// corporate intranets, or any v4 prefix the user wants to keep
+	// off the tunnel.
+	DirectIPs []netip.Prefix
+
+	// DirectDomains lists DNS name suffixes whose queries should be
+	// forwarded to UpstreamDNS verbatim (no fake-IP allocation), and
+	// whose resolved IPs are dynamically added to the bypass set with
+	// a TTL matching the DNS reply. Suffix matching: "example.com"
+	// matches "example.com" and "foo.example.com" but not
+	// "notexample.com". Requires UpstreamDNS to be set.
+	DirectDomains []string
+
+	// UpstreamDNS is the resolver used for DirectDomains queries.
+	// Required if DirectDomains is non-empty. Format "ip:port"; the
+	// :53 port may be omitted. Only one upstream is supported in v1
+	// (no failover / round-robin).
+	UpstreamDNS string
 }
 
 // Dialer is the subset of snell.Client the TUN inbound needs.

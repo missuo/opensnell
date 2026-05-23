@@ -137,7 +137,17 @@ func New(ctx context.Context, cfg Config, dialer Dialer, log *slog.Logger) (Inbo
 		return nil, fmt.Errorf("snell-tun: create TUN device: %w", err)
 	}
 
-	h := &handler{ctx: ctx, dialer: dialer, log: log, pools: pools}
+	var prober *ipv6Prober
+	if !cfg.DisableIPv6 {
+		prober, err = newIPv6Prober(dialer, cfg.IPv6ProbeTarget, cfg.IPv6ProbeInterval, log)
+		if err != nil {
+			_ = ifMon.Close()
+			_ = netMon.Close()
+			return nil, fmt.Errorf("snell-tun: ipv6 prober: %w", err)
+		}
+	}
+
+	h := &handler{ctx: ctx, dialer: dialer, log: log, pools: pools, ipv6: prober}
 
 	stack, err := singtun.NewStack("system", singtun.StackOptions{
 		Context:         ctx,
@@ -168,7 +178,42 @@ func New(ctx context.Context, cfg Config, dialer Dialer, log *slog.Logger) (Inbo
 		return nil, fmt.Errorf("snell-tun: start TUN: %w", err)
 	}
 
-	dns, err := newDNSServer(netip.AddrPortFrom(gateway, 53), pools, log)
+	if prober != nil {
+		prober.Start(ctx)
+	}
+
+	// Bypass + Direct Domain wiring. We construct bypass before the
+	// DNS server because the DNS server holds a reference to the
+	// direct-DNS forwarder which mutates the bypass at runtime.
+	// The AutoRedirect attaches to bypass below (after NewAutoRedirect
+	// returns) so dynamic AddIP calls can re-publish nftables rules.
+	bypass := newLinuxBypass(log)
+	if err := bypass.AddCIDR(cfg.FakeIPPrefix); err != nil {
+		_ = device.Close()
+		_ = stack.Close()
+		_ = ifMon.Close()
+		_ = netMon.Close()
+		return nil, fmt.Errorf("snell-tun: bypass add fake-ip: %w", err)
+	}
+	for _, p := range cfg.DirectIPs {
+		if err := bypass.AddCIDR(p); err != nil {
+			_ = device.Close()
+			_ = stack.Close()
+			_ = ifMon.Close()
+			_ = netMon.Close()
+			return nil, fmt.Errorf("snell-tun: bypass add direct-ip %s: %w", p, err)
+		}
+	}
+	direct, err := newDirectDNS(cfg.UpstreamDNS, cfg.DirectDomains, bypass, cfg.OutputMark, log)
+	if err != nil {
+		_ = device.Close()
+		_ = stack.Close()
+		_ = ifMon.Close()
+		_ = netMon.Close()
+		return nil, fmt.Errorf("snell-tun: direct dns: %w", err)
+	}
+
+	dns, err := newDNSServer(netip.AddrPortFrom(gateway, 53), pools, direct, log)
 	if err != nil {
 		_ = device.Close()
 		_ = stack.Close()
@@ -179,22 +224,10 @@ func New(ctx context.Context, cfg Config, dialer Dialer, log *slog.Logger) (Inbo
 	dns.Start(ctx)
 
 	// AutoRedirect's RouteExcludeAddressSet keeps the fake-IP CIDR
-	// out of the OUTPUT REDIRECT rule, so TCP destined to fake-IPs
-	// flows through the TUN (where our handler reverse-looks up the
-	// hostname) instead of being DNAT'd to the userspace TCP listener
-	// (which would only see the IP, losing the hostname).
-	excludeIPSetBuilder := &netipx.IPSetBuilder{}
-	excludeIPSetBuilder.AddPrefix(cfg.FakeIPPrefix)
-	excludeIPSet, err := excludeIPSetBuilder.IPSet()
-	if err != nil {
-		_ = dns.Close()
-		_ = device.Close()
-		_ = stack.Close()
-		_ = ifMon.Close()
-		_ = netMon.Close()
-		return nil, fmt.Errorf("snell-tun: build route-exclude set: %w", err)
-	}
-	routeExcludeSets := []*netipx.IPSet{excludeIPSet}
+	// (and any user-configured DirectIPs, plus dynamic IPs from the
+	// Direct Domain DNS path) out of the OUTPUT REDIRECT rule, so
+	// matching TCP flows are NOT DNAT'd to the userspace listener.
+	// Bypass + static prefixes were initialized above.
 	emptyAddressSets := []*netipx.IPSet{}
 
 	redirect, err := singtun.NewAutoRedirect(singtun.AutoRedirectOptions{
@@ -206,7 +239,7 @@ func New(ctx context.Context, cfg Config, dialer Dialer, log *slog.Logger) (Inbo
 		InterfaceFinder:        finder,
 		TableName:              "snell_tun",
 		RouteAddressSet:        &emptyAddressSets,
-		RouteExcludeAddressSet: &routeExcludeSets,
+		RouteExcludeAddressSet: bypass.routeSetPointer(),
 	})
 	if err != nil {
 		_ = dns.Close()
@@ -224,6 +257,7 @@ func New(ctx context.Context, cfg Config, dialer Dialer, log *slog.Logger) (Inbo
 		_ = netMon.Close()
 		return nil, fmt.Errorf("snell-tun: start auto-redirect: %w", err)
 	}
+	bypass.attach(ctx, redirect)
 
 	log.Info("snell tun ready (linux / auto-redirect)",
 		"iface", cfg.TUNName,
@@ -232,6 +266,9 @@ func New(ctx context.Context, cfg Config, dialer Dialer, log *slog.Logger) (Inbo
 		"mtu", cfg.MTU,
 		"output-mark", fmt.Sprintf("0x%x", cfg.OutputMark),
 		"exclude-uids", cfg.ExcludeUIDs,
+		"direct-ips", cfg.DirectIPs,
+		"direct-domains", cfg.DirectDomains,
+		"upstream-dns", cfg.UpstreamDNS,
 	)
 
 	return &inbound{
@@ -241,6 +278,8 @@ func New(ctx context.Context, cfg Config, dialer Dialer, log *slog.Logger) (Inbo
 		device:   device,
 		ifMon:    ifMon,
 		netMon:   netMon,
+		prober:   prober,
+		bypass:   bypass,
 		log:      log,
 	}, nil
 }
@@ -253,6 +292,8 @@ type inbound struct {
 	device    singtun.Tun
 	ifMon     singtun.DefaultInterfaceMonitor
 	netMon    singtun.NetworkUpdateMonitor
+	prober    *ipv6Prober
+	bypass    *linuxBypass
 	log       *slog.Logger
 }
 
@@ -275,6 +316,14 @@ func (i *inbound) Close() error {
 		// Monitors last.
 		rec(i.ifMon.Close())
 		rec(i.netMon.Close())
+		// Prober is independent of the data path; stop it after the
+		// data path is fully torn down so an in-flight probe dial
+		// does not race against the dialer close.
+		i.prober.Close()
+		// Bypass reaper stops here — UpdateRouteAddressSet calls go
+		// through AutoRedirect which is already closed above; reaper
+		// republishes would be no-ops anyway.
+		_ = i.bypass.Close()
 		i.log.Info("snell tun closed")
 	})
 	return firstErr
@@ -292,6 +341,12 @@ type handler struct {
 	dialer Dialer
 	log    *slog.Logger
 	pools  *FakePools
+	// ipv6 is nil iff DisableIPv6 was set in config. When non-nil,
+	// handler queries Allowed() to gate real (non-fake-IP) v6
+	// destinations: refusing the connection lets happy-eyeballs apps
+	// fall back to A quickly instead of hanging on a v6 dial the
+	// snell server will never complete.
+	ipv6 *ipv6Prober
 }
 
 // PrepareConnection — see comments in v1 implementation. Always defer
@@ -314,6 +369,12 @@ func (h *handler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 		}
 	}()
 
+	if h.shouldDropV6(destination) {
+		h.log.Debug("tun tcp: drop real ipv6 (server v6 path not available)",
+			"dst", destination.String(), "src", source.String())
+		return
+	}
+
 	host, port, ok := h.resolveDest(destination)
 	if !ok {
 		// fake-IP that has no pool entry — likely a scanner or a stale
@@ -332,6 +393,26 @@ func (h *handler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 
 	h.log.Debug("tun tcp", "src", source.String(), "dst-orig", destination.String(), "dst-real", host)
 	utils.Relay(conn, upstream)
+}
+
+// shouldDropV6 reports whether the destination is a real (non-fake-IP)
+// IPv6 address that we must reject because the server is known to
+// have no working v6 path. Fake-IPv6 destinations (when configured)
+// are always allowed — those tunnel via AtypDomainName regardless.
+func (h *handler) shouldDropV6(dst M.Socksaddr) bool {
+	addr := dst.Addr.Unmap()
+	if !addr.IsValid() || addr.Is4() {
+		return false
+	}
+	if h.pools.Contains(addr) {
+		return false
+	}
+	// Real v6 destination. Drop iff v6 is fully disabled OR the
+	// runtime probe says the server cannot reach v6.
+	if h.ipv6 == nil {
+		return true
+	}
+	return !h.ipv6.Allowed()
 }
 
 // resolveDest returns the snell-side (host, port) for a given
