@@ -10,6 +10,13 @@ import (
 	"time"
 )
 
+// reaperInterval is how often platform BypassManager implementations
+// sweep expired dynamic entries. Short enough that a TTL=60s DNS
+// answer doesn't keep the IP in the bypass set for long after
+// expiry, long enough that we don't spam route / nftables updates
+// on idle traffic.
+const reaperInterval = 30 * time.Second
+
 // BypassManager is the platform-agnostic abstraction the TUN inbound
 // uses to maintain the set of destinations that should bypass the
 // proxy entirely (handled by the host's normal routing).

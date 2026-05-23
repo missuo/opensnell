@@ -195,6 +195,39 @@ func New(ctx context.Context, cfg Config, dialer Dialer, log *slog.Logger) (Inbo
 		prober.Start(ctx)
 	}
 
+	// Bypass manager + Direct Domain wiring. The bypass impl shells
+	// out to `route` and persists added entries so a SIGKILL'd
+	// previous run can have its routes reclaimed at startup. The
+	// reclaim runs synchronously inside newDarwinBypass.
+	bypass, err := newDarwinBypass(ctx, "", log)
+	if err != nil {
+		_ = stack.Close()
+		_ = device.Close()
+		_ = ifMon.Close()
+		_ = netMon.Close()
+		return nil, fmt.Errorf("snell-tun: bypass init: %w", err)
+	}
+	for _, p := range cfg.DirectIPs {
+		if err := bypass.AddCIDR(p); err != nil {
+			_ = bypass.Close()
+			_ = stack.Close()
+			_ = device.Close()
+			_ = ifMon.Close()
+			_ = netMon.Close()
+			return nil, fmt.Errorf("snell-tun: bypass add direct-ip %s: %w", p, err)
+		}
+	}
+	direct, err := newDirectDNS(cfg.UpstreamDNS, cfg.DirectDomains, bypass, 0, log)
+	if err != nil {
+		_ = bypass.Close()
+		_ = stack.Close()
+		_ = device.Close()
+		_ = ifMon.Close()
+		_ = netMon.Close()
+		return nil, fmt.Errorf("snell-tun: direct dns: %w", err)
+	}
+	h.direct = direct
+
 	// Override the host's system DNS to point at our gateway. macOS's
 	// mDNSResponder otherwise uses per-network-service DNS scoping —
 	// it binds queries to the Wi-Fi / Ethernet source interface and
@@ -219,6 +252,9 @@ func New(ctx context.Context, cfg Config, dialer Dialer, log *slog.Logger) (Inbo
 		"mtu", cfg.MTU,
 		"exclude-ips", cfg.ServerIPs,
 		"dns-overrides", len(dnsBackups),
+		"direct-ips", cfg.DirectIPs,
+		"direct-domains", cfg.DirectDomains,
+		"upstream-dns", cfg.UpstreamDNS,
 	)
 
 	return &darwinInbound{
@@ -228,6 +264,7 @@ func New(ctx context.Context, cfg Config, dialer Dialer, log *slog.Logger) (Inbo
 		netMon:     netMon,
 		dnsBackups: dnsBackups,
 		prober:     prober,
+		bypass:     bypass,
 		log:        log,
 	}, nil
 }
@@ -240,6 +277,7 @@ type darwinInbound struct {
 	netMon     singtun.NetworkUpdateMonitor
 	dnsBackups []dnsBackup
 	prober     *ipv6Prober
+	bypass     *darwinBypass
 	log        *slog.Logger
 }
 
@@ -266,6 +304,11 @@ func (i *darwinInbound) Close() error {
 		rec(i.ifMon.Close())
 		rec(i.netMon.Close())
 		i.prober.Close()
+		// Bypass close runs after the data path is fully torn down,
+		// so route deletes don't race against in-flight DNS-forwarder
+		// dynamic AddIPs. Also writes a final empty state file so
+		// the next clean start has nothing to reclaim.
+		rec(i.bypass.Close())
 		i.log.Info("snell tun closed")
 	})
 	return firstErr
@@ -288,6 +331,10 @@ type darwinHandler struct {
 	// QUIC apps fall back to TCP fast. Mirrors handler.tun in
 	// tun_linux.go.
 	tun singtun.Tun
+	// direct routes Direct-Domain DNS queries to the configured
+	// upstream resolver and registers returned IPs with the bypass
+	// manager. Nil = feature disabled (no DirectDomains in config).
+	direct *directDNS
 }
 
 // PrepareConnection — defer everything to NewConnectionEx /
@@ -418,9 +465,7 @@ func (h *darwinHandler) NewPacketConnectionEx(ctx context.Context, conn N.Packet
 		}
 		_ = dnsDst // not used: every packet on this flow targets `destination`
 
-		// direct=nil on darwin until the BypassManager macOS impl
-		// lands (route-add / pfctl via privileged helper).
-		resp, ok := ServeDNSQuery(buffer.Bytes(), h.pools, nil, h.log)
+		resp, ok := ServeDNSQuery(buffer.Bytes(), h.pools, h.direct, h.log)
 		buffer.Release()
 		if !ok || len(resp) == 0 {
 			continue

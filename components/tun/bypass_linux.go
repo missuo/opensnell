@@ -51,12 +51,6 @@ type linuxBypass struct {
 	reaperWG     sync.WaitGroup
 }
 
-// reaperInterval is how often we sweep expired dynamic entries.
-// Short enough that a TTL=60s DNS answer doesn't keep the IP in the
-// bypass set for long after expiry, long enough that we don't spam
-// nftables updates on idle traffic.
-const reaperInterval = 30 * time.Second
-
 func newLinuxBypass(log *slog.Logger) *linuxBypass {
 	return &linuxBypass{
 		log:        log,
