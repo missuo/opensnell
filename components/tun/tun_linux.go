@@ -149,6 +149,7 @@ func New(ctx context.Context, cfg Config, dialer Dialer, log *slog.Logger) (Inbo
 
 	h := &handler{ctx: ctx, dialer: dialer, log: log, pools: pools, ipv6: prober}
 
+	h.tun = device
 	stack, err := singtun.NewStack("system", singtun.StackOptions{
 		Context:         ctx,
 		Tun:             device,
@@ -347,6 +348,11 @@ type handler struct {
 	// fall back to A quickly instead of hanging on a v6 dial the
 	// snell server will never complete.
 	ipv6 *ipv6Prober
+	// tun is the device used to inject synthetic packets back to the
+	// app (currently: ICMP Port Unreachable for UDP/443 to trigger
+	// QUIC → TCP fallback). nil during early init; set before the
+	// stack is started.
+	tun singtun.Tun
 }
 
 // PrepareConnection — see comments in v1 implementation. Always defer
@@ -434,16 +440,38 @@ func (h *handler) resolveDest(dst M.Socksaddr) (host string, port uint16, ok boo
 	return dst.AddrString(), dst.Port, dst.Port != 0
 }
 
-// NewPacketConnectionEx is required by the Handler interface. We do
-// not handle UDP in v2 (DNS is the only UDP we care about, and it's
-// served directly by the in-process DNS server bound to the TUN
-// gateway — sing-tun's DNS hijack DNATs UDP 53 there, so it never
-// arrives via this packet-conn callback). Drop silently.
-func (h *handler) NewPacketConnectionEx(_ context.Context, conn N.PacketConn, _ M.Socksaddr, _ M.Socksaddr, onClose N.CloseHandlerFunc) {
-	_ = conn.Close()
-	if onClose != nil {
-		onClose(nil)
+// NewPacketConnectionEx is required by the Handler interface. The
+// v2 TUN does not proxy UDP application traffic, but we treat
+// UDP/443 (web QUIC) specially: instead of silently dropping it
+// (forcing the browser to wait ~10s before falling back to TCP),
+// we inject an ICMP Port Unreachable back to the app so QUIC
+// abandons immediately and switches to HTTP/2 over TCP. Every
+// other UDP flow is still dropped silently — sending ICMP for
+// random UDP services (games, VoIP) could break those apps.
+//
+// DNS UDP never reaches here on Linux: sing-tun's nft DNS hijack
+// DNATs UDP/53 to our fake-IP DNS server at the gateway address,
+// which has its own listener.
+func (h *handler) NewPacketConnectionEx(_ context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+	defer func() {
+		_ = conn.Close()
+		if onClose != nil {
+			onClose(nil)
+		}
+	}()
+	if destination.Port == quicTriggerPort && h.tun != nil {
+		src := netip.AddrPortFrom(source.Addr.Unmap(), source.Port)
+		dst := netip.AddrPortFrom(destination.Addr.Unmap(), destination.Port)
+		if err := sendQUICPortUnreachable(h.tun, src, dst); err != nil {
+			h.log.Debug("tun udp: icmp unreachable inject failed",
+				"src", src.String(), "dst", dst.String(), "err", err)
+		} else {
+			h.log.Debug("tun udp: quic fallback icmp sent",
+				"src", src.String(), "dst", dst.String())
+		}
+		return
 	}
+	h.log.Debug("tun udp: drop non-quic", "src", source.String(), "dst", destination.String())
 }
 
 // slogAdapter satisfies sing's logger.Logger by forwarding to slog.

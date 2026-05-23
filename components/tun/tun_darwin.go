@@ -160,6 +160,7 @@ func New(ctx context.Context, cfg Config, dialer Dialer, log *slog.Logger) (Inbo
 		log:    log,
 		pools:  pools,
 		ipv6:   prober,
+		tun:    device,
 	}
 
 	stack, err := singtun.NewStack("system", singtun.StackOptions{
@@ -283,6 +284,10 @@ type darwinHandler struct {
 	// probe of server v6 reachability. Nil iff config disabled v6.
 	// See handler.shouldDropV6 in tun_linux.go for the rationale.
 	ipv6 *ipv6Prober
+	// tun is the device used to inject ICMP Port Unreachable so
+	// QUIC apps fall back to TCP fast. Mirrors handler.tun in
+	// tun_linux.go.
+	tun singtun.Tun
 }
 
 // PrepareConnection — defer everything to NewConnectionEx /
@@ -384,6 +389,18 @@ func (h *darwinHandler) NewPacketConnectionEx(ctx context.Context, conn N.Packet
 	}()
 
 	if destination.Port != 53 {
+		if destination.Port == quicTriggerPort && h.tun != nil {
+			src := netip.AddrPortFrom(source.Addr.Unmap(), source.Port)
+			dst := netip.AddrPortFrom(destination.Addr.Unmap(), destination.Port)
+			if err := sendQUICPortUnreachable(h.tun, src, dst); err != nil {
+				h.log.Debug("tun udp: icmp unreachable inject failed",
+					"src", src.String(), "dst", dst.String(), "err", err)
+			} else {
+				h.log.Debug("tun udp: quic fallback icmp sent",
+					"src", src.String(), "dst", dst.String())
+			}
+			return
+		}
 		h.log.Debug("tun udp: drop non-dns", "src", source.String(), "dst", destination.String())
 		return
 	}
