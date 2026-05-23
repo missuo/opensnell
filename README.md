@@ -46,6 +46,9 @@ the current Surge `snell-server` speaks.
 | **QUIC proxy mode (v5)**              | ✅             | use Surge      |
 | **`tcp-brutal` CC (experimental, Linux only)** | ✅    | ✅             |
 | **TUN inbound with fake-IP DNS (experimental, Linux + macOS)** | — | ✅      |
+| **TUN: Direct IP / Direct Domain bypass (experimental)** | — | ✅           |
+| **TUN: in-tunnel IPv6 reachability probe** | — | ✅                          |
+| **TUN: ICMP-unreachable QUIC fast-fail on UDP/443** | — | ✅                 |
 
 ## Install
 
@@ -345,14 +348,28 @@ the snell server itself does the resolution from its presumably
 uncontaminated upstream (and you can pin that upstream via the
 server's `dns = …`).
 
-#### IPv4-only, by design
+#### IPv6 strategy
 
-Both platforms run an **IPv4-only** fake-IP path. AAAA queries get
-an empty NOERROR reply so resolvers fall back to A; the snell server
-then resolves the hostname against its own DNS and connects v4. This
-sidesteps two distinct failure modes: (a) v6-capable hosts whose v6
-DNS path bypasses our fake-IP layer entirely, and (b) v4-only snell
-servers that can't reach v6 destinations.
+The fake-IP path is **IPv4-only**: AAAA queries get an empty
+NOERROR reply so resolvers fall back to A; the snell server then
+resolves the hostname against its own DNS and connects v4.
+
+That alone doesn't catch traffic that bypasses our fake-DNS — e.g.
+Chrome's Secure DNS / Firefox DoH, services that cache AAAA, apps
+that connect to literal v6 addresses. For those, the TUN handler
+runs an **in-tunnel IPv6 reachability probe** at startup and every
+5 minutes: it dials `[2606:4700:4700::1111]:443` (Cloudflare DNS)
+through the snell tunnel. If that succeeds the server has a working
+v6 egress, and real-v6 destinations arriving at the handler are
+forwarded normally. If the probe fails, real-v6 destinations on the
+handler are dropped immediately so happy-eyeballs apps fall back to
+A in milliseconds instead of stalling for the kernel's connect
+timeout.
+
+The `ipv6 = false` knob (under `[snell-tun]`) forces v6 off
+regardless of the probe — for hosts whose v6 connectivity is broken
+in ways the probe target can't detect, or where you just want
+deterministic v4-only behavior.
 
 #### Per-platform mechanism
 
@@ -364,7 +381,10 @@ servers that can't reach v6 destinations.
 | Bypass for snell-client's own outbound to server | `SO_MARK 0x2024` matched in OUTPUT chain         | snell server IP installed as `Inet4RouteExcludeAddress` |
 | Preserving host's inbound services             | precise (conntrack-based PREROUTING bypass)        | works for typical workstations; do not run on hosts that accept public inbound connections |
 | Per-process exclusion (`realm`/`gost` etc.)    | `exclude-uid` (nftables UID match)                 | not supported (macOS has no equivalent kernel hook)  |
-| Cleanup on `SIGTERM`/`SIGINT`                  | nftables table dropped, `ip rule` priority-1 entry removed | utun destroyed, auto-routes deleted, system DNS restored |
+| Direct IP / Direct Domain bypass               | `netipx.IPSet` fed into `RouteExcludeAddressSet`; live republished via `AutoRedirect.UpdateRouteAddressSet()` | `/sbin/route add -host/-net … -interface <iface>`; longest-prefix-match wins over the utun auto-route half-prefixes. Default interface detected at startup |
+| Stale-route reclaim across crashes             | not needed (nftables table is dropped wholesale on every start) | `/var/run/opensnell-bypass.state` replayed on startup — each entry gets `route delete`d, then the file is truncated |
+| QUIC fast-fail                                 | ICMP Port Unreachable for UDP/443 to fake-IP destinations | ICMP Port Unreachable for UDP/443 to any destination caught by the TUN |
+| Cleanup on `SIGTERM`/`SIGINT`                  | nftables table dropped, `ip rule` priority-1 entry removed | utun destroyed, auto-routes deleted, system DNS restored, direct routes removed |
 
 The reason DNS interception differs: macOS's `mDNSResponder` uses
 per-network-service DNS scoping, binding queries to the
@@ -387,9 +407,10 @@ they differ:
 | New outbound TCP from local processes (by hostname)  | **Redirected via fake-IP** → snell server with `AtypDomainName` |
 | New outbound TCP from local processes (literal IP)   | **Redirected via REDIRECT (Linux) / TUN default route (macOS)** → snell server with `AtypIPv4` |
 | `snell-client`'s own connection to the snell server  | **Linux: unchanged** (SO_MARK 0x2024 matched in OUTPUT). **macOS: unchanged** (server IP installed as `Inet4RouteExcludeAddress`, so kernel never sends it via TUN) |
-| AAAA DNS queries                                     | Empty NOERROR (apps fall back to A). No IPv6 fake-IP path |
-| Outbound IPv6 traffic                                | **Not captured** — TUN is v4-only. Apps that already hold a real v6 address (e.g. literal IP, cached) connect over their native v6 path if they have one, bypassing snell |
-| UDP from local processes (other than DNS)            | **Linux: unchanged** (we capture DNS only). **macOS: dropped** (TUN catches all v4 UDP; v2 only handles DNS) |
+| AAAA DNS queries                                     | Empty NOERROR (apps fall back to A) for proxied names; **real records** for Direct Domains. No IPv6 fake-IP path |
+| Outbound IPv6 traffic to **real** v6 destinations    | **Linux/macOS: gated by the v6 probe** — accepted only when the snell server has working v6 egress; otherwise dropped so apps fall back to A. See "IPv6 strategy" above |
+| Outbound UDP/443 (web QUIC)                          | **ICMP Port Unreachable injected** back to the app so the QUIC stack abandons immediately and falls back to TCP — instead of the ~10s timeout the silent-drop behavior would cause |
+| Other UDP from local processes (other than DNS, 443) | **Linux: unchanged** for real IPs (we capture DNS only); fake-IP UDP dropped silently. **macOS: dropped** (TUN catches all v4 UDP; v2 only handles DNS) |
 | ICMP from local processes                            | **Linux: unchanged.** **macOS: dropped** |
 | `FORWARD`-chain / IP-forwarded traffic               | **Linux: unchanged** (we don't touch FORWARD). **macOS: not applicable** |
 
@@ -423,6 +444,62 @@ with ISP-poisoned DHCP DNS.
   rewrite the system DNS. `networksetup` is part of the base system.
 - Plain SOCKS5 mode remains usable without root from the same binary
   on both platforms.
+
+#### Direct IP / Direct Domain bypass
+
+In addition to "everything goes through snell", you can mark
+specific destinations as **direct** — the host's own routing stack
+handles them, snell never sees them. Useful for LAN ranges,
+corporate intranets, or third-party services that misbehave behind
+a proxy.
+
+Two scopes, both configured under `[snell-tun]`:
+
+- **`direct-ip`** — comma-separated CIDRs (`10.0.0.0/8, 192.168.0.0/16`)
+  or bare IPs (`1.1.1.1, 8.8.8.8`). Static, set at startup.
+- **`direct-domain`** — comma-separated DNS-suffix list
+  (`internal.example.com, intranet.local`). When the fake-IP DNS
+  server sees a matching query, it forwards it verbatim to
+  `upstream-dns` instead of synthesizing a fake-IP, then dynamically
+  registers each A/AAAA record in the bypass set with the record's
+  own TTL. A 30-second reaper sweeps expired entries.
+
+Both knobs flow into the same per-platform bypass mechanism:
+
+| Platform | Bypass mechanism |
+| -------- | ---------------- |
+| **Linux** | Adds entries to a `netipx.IPSet`, then calls sing-tun's `AutoRedirect.UpdateRouteAddressSet()` so nftables re-publishes its REDIRECT-exclude set on the fly |
+| **macOS** | Calls `route add -host <ip> -interface <default-iface>` so the kernel's longest-prefix-match wins over sing-tun's auto-route half-prefixes. Default interface detected once via `route -n get default` |
+
+The Direct-Domain DNS forwarder uses snell-client's `OutputMark`
+(SO_MARK 0x2024) on Linux so its upstream UDP query escapes
+sing-tun's nft DNS hijack — without that mark, the forwarder would
+loop straight back into our own fake-IP DNS server.
+
+**Persistence across crashes (macOS):** every route the bypass
+manager installs is also recorded in
+`/var/run/opensnell-bypass.state` (atomic temp+rename). On startup
+the state file is replayed — each entry gets `route delete`d
+before the file is truncated — so a SIGKILLed previous run does
+not leave the kernel routing table polluted with orphan /32
+entries. Linux doesn't need an equivalent: sing-tun's nftables
+table is dropped wholesale on every start, taking the exclude
+set with it.
+
+Example:
+
+```ini
+[snell-tun]
+enable = true
+
+direct-ip = 10.0.0.0/8, 192.168.0.0/16, 1.1.1.1
+direct-domain = corp.example.com, lan.local
+upstream-dns = 223.5.5.5:53
+```
+
+After startup, `curl https://corp.example.com/internal` hits the
+real internal host via the host's native route, while
+`curl https://www.cloudflare.com/` still tunnels through snell.
 
 #### Excluding specific services (Linux only)
 
@@ -473,9 +550,48 @@ enable = true
 
 ; Comma-separated UIDs and/or usernames whose outbound TCP should
 ; bypass the redirect and egress direct. Usernames are resolved via
-; the system passwd database at startup. Typical use case: transparent
-; TCP forwarders running as their own user.
+; the system passwd database at startup. Linux only — macOS has no
+; equivalent kernel hook. Typical use case: transparent TCP
+; forwarders running as their own user.
 ;exclude-uid = realm, gost
+
+; IPv6 master switch. Default true. When true (or unset), snell-client
+; probes the server's v6 reachability at startup and every 5 minutes
+; by dialing a known v6 endpoint through the tunnel; real-v6
+; destinations are accepted at the TUN handler only when the probe
+; says the server can reach v6. Set to false to force-disable v6
+; handling regardless of the probe — useful when the probe target is
+; blocked on the path but the server still can't actually use v6.
+;ipv6 = true
+
+; Override the v6 reachability probe target. Format: "[v6]:port".
+; Default [2606:4700:4700::1111]:443 (Cloudflare DNS).
+;ipv6-probe-target = [2606:4700:4700::1111]:443
+
+; How often to re-run the v6 probe. Accepts Go duration strings.
+; Default 5 minutes.
+;ipv6-probe-interval = 5m
+
+; Direct IP — comma-separated CIDRs (or bare IPs, treated as /32 or
+; /128) that should bypass the proxy entirely and use the host's
+; normal routing. Static; loaded once at startup. Typical entries:
+; LAN ranges, corporate intranet prefixes, services that misbehave
+; behind a proxy.
+;direct-ip = 10.0.0.0/8, 192.168.0.0/16, 1.1.1.1
+
+; Direct Domain — comma-separated DNS-suffix list. Matching queries
+; are forwarded to upstream-dns (real records, not fake-IPs), and
+; each returned A/AAAA address is registered in the bypass set with
+; the record's own TTL. Suffix match: "example.com" matches
+; "example.com" and "foo.example.com" but not "notexample.com".
+; Requires upstream-dns to be set.
+;direct-domain = corp.example.com, lan.local
+
+; Upstream DNS used by direct-domain query forwarding. Format
+; "ip:port"; the :53 port may be omitted. Only consulted for names
+; matching a direct-domain suffix; other queries continue to use
+; the fake-IP layer. No default — required when direct-domain is set.
+;upstream-dns = 223.5.5.5:53
 ```
 
 Run:
@@ -488,10 +604,49 @@ You can keep `[snell-client]` `listen = 127.0.0.1:1080` to run both the
 SOCKS5 listener and the TUN inbound at once, or set `listen = off` to
 run TUN only.
 
-Not in v2 (planned for later): UDP application traffic capture (DNS
-itself is captured but other UDP — WebRTC, QUIC, etc. — still egresses
-direct); cgroup-v2 based exclusion (so a systemd unit can be exempted
-without changing its `User=`); macOS and Windows.
+#### Known limitations / future work
+
+- **Fake-IPv6 pool**: AAAA queries currently return an empty NOERROR
+  so apps fall back to A. We never allocate fake-IPv6 addresses. This
+  means a v6-only destination (no A record) accessed through the
+  proxy will not work. Workaround for now: list such names under
+  `direct-domain` if you have direct v6 reachability, otherwise the
+  domain has to be reachable via v4. A future v3 will add a ULA
+  fake-IPv6 pool when the v6 probe succeeds.
+
+- **Linux IPv6 UDP intercept**: on Linux only IPv4 UDP/443 flows
+  reach the handler (the TUN owns the fake-IPv4 CIDR; nft auto-
+  redirect is TCP-only). Real-v6 UDP traffic, including v6 QUIC,
+  goes via the host's native interface and does not get the ICMP
+  fallback. In practice this only matters if your server has no v6
+  but the host does — apps will keep using v6 QUIC successfully via
+  the native path, which is the desired outcome anyway.
+
+- **macOS default-interface hot-switch**: the bypass manager detects
+  the default physical interface once at startup. If you Wi-Fi →
+  Ethernet hot-switch while snell-client is running, existing
+  direct routes remain pinned to the old interface and stop
+  working until you restart. Subscribing to sing-tun's default-
+  interface monitor and reinstalling routes on change is on the
+  list.
+
+- **QUIC over non-443 UDP ports**: only UDP/443 (the well-known
+  HTTP/3 port) gets the ICMP unreachable injection. Custom QUIC
+  apps on other ports still drop silently; sending ICMP on every
+  random UDP port would break games / VoIP / mDNS, which is worse
+  than a 10s QUIC timeout.
+
+- **UDP application traffic proxying**: still not implemented (DNS
+  and UDP/443 ICMP injection are the only UDP we do anything with).
+  WebRTC and other UDP-native apps egress direct on Linux, get
+  dropped on macOS. Out of scope for the alpha.
+
+- **cgroup-v2 based exclusion** (Linux): currently we match
+  bypass-users by UID. A systemd unit's `User=` is the workaround.
+  Native cgroup-v2 path classification would let exemption follow
+  the unit identity, but isn't done yet.
+
+- **Windows**: not supported.
 
 ### Example end-to-end smoke test
 
