@@ -138,6 +138,39 @@ ensure_tools() {
 # ============================================================================
 gen_psk() { openssl rand -base64 18 | tr -d '/+=' | cut -c1-24; }
 
+base64_encode() {
+    if command -v base64 >/dev/null 2>&1; then
+        printf '%s' "$1" | base64 | tr -d '\n'
+    else
+        printf '%s' "$1" | openssl base64 -A
+    fi
+}
+
+url_encode() {
+    local byte dec ch byte_upper out=""
+    for byte in $(printf '%s' "$1" | od -An -tx1 -v); do
+        dec=$((16#$byte))
+        if { [ "$dec" -ge 48 ] && [ "$dec" -le 57 ]; } \
+            || { [ "$dec" -ge 65 ] && [ "$dec" -le 90 ]; } \
+            || { [ "$dec" -ge 97 ] && [ "$dec" -le 122 ]; } \
+            || [ "$dec" -eq 45 ] || [ "$dec" -eq 46 ] \
+            || [ "$dec" -eq 95 ] || [ "$dec" -eq 126 ]; then
+            printf -v ch '%b' "\\x${byte}"
+            out+="$ch"
+        else
+            printf -v byte_upper '%02X' "$dec"
+            out+="%${byte_upper}"
+        fi
+    done
+    printf '%s' "$out"
+}
+
+yaml_double_quote_escape() {
+    local value="${1//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    printf '%s' "$value"
+}
+
 # Pick a free random port in [10000, 60000] that's not occupied (TCP + UDP).
 pick_free_port() {
     local p
@@ -611,6 +644,22 @@ show_info() {
     local tfo_param=""
     [ "$tfo" = "true" ] && tfo_param=", tfo=true"
     echo -e "${GREEN}${node_name} = snell, ${ip}, ${port}, psk=\"${psk}\", version=5${tfo_param}${NC}"
+
+    print_header "Mihomo proxy (copy into proxies)"
+    local mihomo_name mihomo_server mihomo_psk
+    mihomo_name=$(yaml_double_quote_escape "$node_name")
+    mihomo_server=$(yaml_double_quote_escape "$ip")
+    mihomo_psk=$(yaml_double_quote_escape "$psk")
+    printf '%b- {name: "%s", server: "%s", port: %s, type: snell, psk: "%s", version: 5}%b\n' \
+        "$GREEN" "$mihomo_name" "$mihomo_server" "$port" "$mihomo_psk" "$NC"
+
+    print_header "Shadowrocket URL"
+    local shadowrocket_payload shadowrocket_name shadowrocket_tfo
+    shadowrocket_payload=$(base64_encode "chacha20-ietf-poly1305:${psk}@${ip}:${port}")
+    shadowrocket_name=$(url_encode "$node_name")
+    if [ "$tfo" = "true" ]; then shadowrocket_tfo="1"; else shadowrocket_tfo="0"; fi
+    printf '%bsnell://%s?tfo=%s&version=5#%s%b\n' \
+        "$GREEN" "$shadowrocket_payload" "$shadowrocket_tfo" "$shadowrocket_name" "$NC"
 
     print_header "Service"
     systemctl is-active --quiet "$SERVICE_NAME" \
