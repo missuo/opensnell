@@ -7,6 +7,7 @@ package snell
 
 import (
 	"context"
+	"crypto/cipher"
 	cryptorand "crypto/rand"
 	"encoding/binary"
 	"errors"
@@ -164,7 +165,11 @@ func (s *Server) ServeQUIC(ctx context.Context) error {
 		}
 
 		// New flow — try to decode the envelope.
-		target, inner, derr := s.decodeQUICEnvelope(buf[:n])
+		srcIP := ""
+		if raddr != nil {
+			srcIP = raddr.IP.String()
+		}
+		target, inner, user, derr := s.decodeQUICEnvelope(buf[:n], srcIP)
 		if derr != nil {
 			s.logger.Debug("quic envelope decode failed", "remote", raddr.String(), "err", derr)
 			continue
@@ -187,6 +192,7 @@ func (s *Server) ServeQUIC(ctx context.Context) error {
 			"client", raddr.String(),
 			"target", target,
 			"inner_size", len(inner),
+			"user", user,
 		)
 
 		// Send the unwrapped QUIC initial upstream.
@@ -241,39 +247,98 @@ func (s *Server) dialUDPUpstream(ctx context.Context, target string) (net.Conn, 
 }
 
 // decodeQUICEnvelope attempts to interpret packet as a snell v5 QUIC
-// envelope and return the embedded target ("host:port") and the inner
-// raw QUIC packet bytes ready to forward upstream.
-func (s *Server) decodeQUICEnvelope(packet []byte) (target string, inner []byte, err error) {
+// envelope and return the embedded target ("host:port"), the inner
+// raw QUIC packet bytes ready to forward upstream, and (in multi-user
+// mode) the matched user's Name.
+//
+// Single-user mode (s.auth == nil) preserves the original fast path
+// byte-for-byte: one Argon2 + one AES-GCM Open under cfg.PSK. Multi-
+// user mode looks up the client's source IP in the same LRU that the
+// TCP path uses, then falls back to a full scan on miss.
+//
+// srcIP is the QUIC client's source IP used as the LRU key; pass "" to
+// skip LRU lookup (cold-path scan only).
+func (s *Server) decodeQUICEnvelope(packet []byte, srcIP string) (target string, inner []byte, user string, err error) {
 	if len(packet) < quicSaltLen+quicHeaderCipher+16 {
-		return "", nil, errors.New("envelope too short")
+		return "", nil, "", errors.New("envelope too short")
 	}
 	salt := packet[:quicSaltLen]
 	rest := packet[quicSaltLen:]
-
-	aead, err := v4AEAD(s.psk, salt)
-	if err != nil {
-		return "", nil, err
+	if len(rest) < quicHeaderCipher {
+		return "", nil, "", errors.New("envelope header truncated")
 	}
+
+	var (
+		aead     cipher.AEAD
+		matchedUser string
+		matchedPSK  []byte
+	)
+
+	if s.auth == nil {
+		// FAST PATH: single-PSK, identical to pre-multi-user code.
+		aead, err = v4AEAD(s.psk, salt)
+		if err != nil {
+			return "", nil, "", err
+		}
+		matchedPSK = s.psk
+	} else {
+		// MULTI-USER PATH: trial-decrypt the 23-byte header against
+		// each registered user (LRU-cached by srcIP).
+		users := s.auth.store.ListUsers()
+		if len(users) == 0 {
+			return "", nil, "", errors.New("no authorized users")
+		}
+		headerCipher := rest[:quicHeaderCipher]
+
+		// Hot path
+		if srcIP != "" {
+			if idx, ok := s.auth.lru.Get(srcIP); ok && idx >= 0 && idx < len(users) {
+				if ae, ok := tryDecryptHeader(users[idx].PSK, salt, headerCipher); ok {
+					aead = ae
+					matchedUser = users[idx].Name
+					matchedPSK = users[idx].PSK
+				}
+			}
+		}
+		// Cold path
+		if aead == nil {
+			matchIdx := s.auth.scanUsers(users, salt, headerCipher)
+			if matchIdx < 0 {
+				return "", nil, "", errors.New("no matching PSK")
+			}
+			ae, aerr := v4AEAD(users[matchIdx].PSK, salt)
+			if aerr != nil {
+				return "", nil, "", aerr
+			}
+			aead = ae
+			matchedUser = users[matchIdx].Name
+			matchedPSK = users[matchIdx].PSK
+			if srcIP != "" {
+				s.auth.lru.Put(srcIP, matchIdx)
+			}
+		}
+	}
+	_ = matchedPSK // we currently only need read-side AEAD for envelope decode
 	nonceLen := aead.NonceSize()
 
-	// Decrypt header with nonce 0.
-	if len(rest) < quicHeaderCipher {
-		return "", nil, errors.New("envelope header truncated")
-	}
+	// AEAD.Open of the header was already done by tryDecryptHeader in
+	// multi-user mode, but it returned only success/failure — we need
+	// the plaintext here to extract padLen/payloadLen. Re-Open with
+	// nonce 0 (AEAD is stateless; safe to Open twice).
 	nonce0 := make([]byte, nonceLen)
 	hdr, err := aead.Open(nil, nonce0, rest[:quicHeaderCipher], nil)
 	if err != nil {
-		return "", nil, fmt.Errorf("header decrypt: %w", err)
+		return "", nil, "", fmt.Errorf("header decrypt: %w", err)
 	}
 	if hdr[0] != quicFrameType {
-		return "", nil, fmt.Errorf("unexpected frame type 0x%02x", hdr[0])
+		return "", nil, "", fmt.Errorf("unexpected frame type 0x%02x", hdr[0])
 	}
 	padLen := int(binary.BigEndian.Uint16(hdr[3:5]))
 	payloadLen := int(binary.BigEndian.Uint16(hdr[5:7]))
 
 	payOff := quicHeaderCipher + padLen
 	if payOff+payloadLen+aead.Overhead() > len(rest) {
-		return "", nil, errors.New("envelope payload truncated")
+		return "", nil, "", errors.New("envelope payload truncated")
 	}
 	// Decrypt payload with nonce 1 (LE-encoded counter, matching the v4
 	// frame's per-frame nonce sequence).
@@ -281,9 +346,10 @@ func (s *Server) decodeQUICEnvelope(packet []byte) (target string, inner []byte,
 	binary.LittleEndian.PutUint64(nonce1, 1)
 	pay, err := aead.Open(nil, nonce1, rest[payOff:payOff+payloadLen+aead.Overhead()], nil)
 	if err != nil {
-		return "", nil, fmt.Errorf("payload decrypt: %w", err)
+		return "", nil, "", fmt.Errorf("payload decrypt: %w", err)
 	}
-	return parseQUICRequest(pay)
+	target, inner, err = parseQUICRequest(pay)
+	return target, inner, matchedUser, err
 }
 
 // parseQUICRequest extracts the target host/port and inner QUIC bytes

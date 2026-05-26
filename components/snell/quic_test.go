@@ -29,7 +29,7 @@ func TestQUICEnvelopeRoundTrip(t *testing.T) {
 	}
 
 	s := &Server{psk: psk}
-	target, gotInner, err := s.decodeQUICEnvelope(env)
+	target, gotInner, _, err := s.decodeQUICEnvelope(env, "")
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -54,7 +54,7 @@ func TestQUICEnvelopeWithRealServerCapture(t *testing.T) {
 	pkt := realCapturedEnvelopePkt1
 
 	s := &Server{psk: psk}
-	target, inner, err := s.decodeQUICEnvelope(pkt)
+	target, inner, _, err := s.decodeQUICEnvelope(pkt, "")
 	if err != nil {
 		t.Fatalf("decode real capture: %v", err)
 	}

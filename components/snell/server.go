@@ -28,8 +28,42 @@ import (
 
 // ServerConfig is the runtime configuration for Server.
 type ServerConfig struct {
-	Listen   string // host:port to bind on
-	PSK      string // shared pre-shared key
+	Listen string // host:port to bind on
+
+	// PSK is the single-user shared secret. Set this for standalone
+	// servers serving one client. Mutually exclusive with UserStore.
+	// When both are set, UserStore wins and PSK is ignored.
+	PSK string
+
+	// UserStore enables multi-user mode: every new connection is
+	// authenticated by trial-decrypting its first frame against each
+	// registered user's PSK. An LRU cache keyed on the client's IP
+	// keeps the steady-state cost at one Argon2 + one AES-GCM per
+	// connection (same as the single-user fast path). See package
+	// docs in user.go and auth.go for details.
+	//
+	// When nil the server runs in the original single-PSK fast path
+	// with zero added latency and zero added allocations per
+	// connection. The multi-user code paths are entirely opt-in.
+	UserStore UserStore
+
+	// OnAuthorize, when non-nil, is invoked after a TCP CONNECT request
+	// has been authenticated and parsed. It receives the matched user's
+	// name, the client's remote address, the target host:port, and a
+	// dialer pre-configured with the server's egress / DNS / TFO knobs.
+	//
+	// Returning a non-nil net.Conn instructs the server to relay using
+	// that conn — callers can wrap the dialer's output to count traffic
+	// or apply per-user rate limits before returning.
+	//
+	// Returning (nil, error) rejects the request: the server sends an
+	// error response frame to the client and closes. Use this to
+	// enforce per-user quotas (over-limit, device-cap exceeded, etc).
+	//
+	// Leave nil to use the built-in dial-and-relay logic — that's the
+	// only behavior in single-user mode.
+	OnAuthorize func(ctx context.Context, info ConnContext, dialer ContextDialer) (net.Conn, error)
+
 	ObfsMode string // "", "off", "http", "tls"
 	UDP      bool   // accept UDP-over-TCP requests
 	DialTimeout time.Duration
@@ -118,6 +152,43 @@ type Server struct {
 	psk      []byte
 	logger   *slog.Logger
 	resolver *net.Resolver // nil when cfg.DNS is empty (use system resolver)
+
+	// auth is non-nil iff cfg.UserStore is non-nil. When nil, the
+	// server runs the single-PSK fast path with no behavior change
+	// from before multi-user support was added.
+	auth *multiUserAuth
+}
+
+// ConnContext describes one authenticated snell connection to the
+// OnAuthorize callback. All fields are valid for a TCP CONNECT request
+// (Command == CommandConnect or CommandConnectV2).
+type ConnContext struct {
+	// User is the matched user's Name (the panel-side UUID for V2Node).
+	// Empty when the server is running in single-PSK fast path mode.
+	User string
+
+	// RemoteAddr is the client's address as seen by the listener,
+	// post-obfs (the obfs layer is purely transport-level and does not
+	// rewrite addresses).
+	RemoteAddr net.Addr
+
+	// Target is the upstream destination in "host:port" form, as
+	// parsed from the snell CONNECT request.
+	Target string
+
+	// Command is one of CommandConnect / CommandConnectV2.
+	Command byte
+
+	// Reuse mirrors the v2 reuse-mode bit (CommandConnectV2).
+	Reuse bool
+}
+
+// ContextDialer is the dialer interface passed to OnAuthorize. The
+// concrete value returned by Server is pre-configured with the server's
+// egress-interface, IPv6, TFO, and custom DNS settings — callers can use
+// it as-is to inherit those, or substitute their own.
+type ContextDialer interface {
+	DialContext(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 // buildResolver returns a net.Resolver that round-trips its DNS queries
@@ -169,8 +240,8 @@ func (s *Server) buildResolver() *net.Resolver {
 }
 
 func NewServer(cfg ServerConfig, logger *slog.Logger) (*Server, error) {
-	if cfg.PSK == "" {
-		return nil, errors.New("snell server requires psk")
+	if cfg.PSK == "" && cfg.UserStore == nil {
+		return nil, errors.New("snell server requires psk or user store")
 	}
 	switch cfg.ObfsMode {
 	case "", "off", "http", "tls":
@@ -184,6 +255,10 @@ func NewServer(cfg ServerConfig, logger *slog.Logger) (*Server, error) {
 		logger = slog.Default()
 	}
 	s := &Server{cfg: cfg, psk: []byte(cfg.PSK), logger: logger}
+	if cfg.UserStore != nil {
+		s.auth = newMultiUserAuth(cfg.UserStore)
+		logger.Info("snell multi-user mode enabled (single-PSK fast path bypassed)")
+	}
 	if cfg.EgressInterface != "" {
 		logger.Info("egress interface", "name", cfg.EgressInterface)
 	}
@@ -385,13 +460,42 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 		s.logger.Warn("obfs server init failed", "err", err)
 		return
 	}
-	stream := ServerStreamConn(conn, s.psk)
+
+	var (
+		stream *Snell
+		user   string
+	)
+
+	if s.auth == nil {
+		// FAST PATH (single-PSK): byte-for-byte equivalent to the
+		// pre-multi-user code. No allocations, no LRU lookups, no
+		// authentication branching. Do not refactor logic from below
+		// into this branch without re-benchmarking.
+		stream = ServerStreamConn(conn, s.psk)
+	} else {
+		// MULTI-USER PATH: read salt + first AEAD header from the
+		// (post-obfs) stream and identify which user's PSK decrypts
+		// it. On hit, hand the v4Reader a pre-derived AEAD plus the
+		// 23 header bytes we consumed so the reader's nonce counter
+		// can step through the same Open() naturally.
+		result, aerr := s.auth.authenticate(conn, extractIP(raw.RemoteAddr()))
+		if aerr != nil {
+			if !errors.Is(aerr, io.EOF) {
+				s.logger.Debug("snell auth failed",
+					"remote", raw.RemoteAddr().String(),
+					"err", aerr)
+			}
+			return
+		}
+		user = result.user.Name
+		stream = ServerStreamConnPrefilled(conn, result.readAEAD, result.prefetchedHdr, result.user.PSK)
+	}
 
 	for {
-		reuse, err := s.handleRequest(ctx, stream)
+		reuse, err := s.handleRequest(ctx, stream, user, raw.RemoteAddr())
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, ErrZeroChunk) {
-				s.logger.Debug("snell request ended", "remote", raw.RemoteAddr().String(), "err", err)
+				s.logger.Debug("snell request ended", "remote", raw.RemoteAddr().String(), "user", user, "err", err)
 			}
 			return
 		}
@@ -401,7 +505,7 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 	}
 }
 
-func (s *Server) handleRequest(ctx context.Context, stream *Snell) (bool, error) {
+func (s *Server) handleRequest(ctx context.Context, stream *Snell, user string, remote net.Addr) (bool, error) {
 	br := bufio.NewReader(stream)
 
 	version, err := br.ReadByte()
@@ -429,7 +533,7 @@ func (s *Server) handleRequest(ctx context.Context, stream *Snell) (bool, error)
 
 	switch command {
 	case CommandConnect, CommandConnectV2:
-		return s.handleTCP(ctx, stream, br, command == CommandConnectV2)
+		return s.handleTCP(ctx, stream, br, command == CommandConnectV2, user, remote)
 	case CommandUDP:
 		if !s.cfg.UDP {
 			return false, writeServerError(stream, 1, "UDP disabled")
@@ -455,7 +559,7 @@ func readClientID(r *bufio.Reader) (string, error) {
 	return string(id), nil
 }
 
-func (s *Server) handleTCP(ctx context.Context, stream *Snell, br *bufio.Reader, reuse bool) (bool, error) {
+func (s *Server) handleTCP(ctx context.Context, stream *Snell, br *bufio.Reader, reuse bool, user string, remote net.Addr) (bool, error) {
 	hostLen, err := br.ReadByte()
 	if err != nil {
 		return false, err
@@ -479,13 +583,34 @@ func (s *Server) handleTCP(ctx context.Context, stream *Snell, br *bufio.Reader,
 		"remote", stream.Conn.RemoteAddr().String(),
 		"target", target,
 		"reuse", reuse,
+		"user", user,
 	)
 
+	// Dial path: when the caller wired up OnAuthorize, defer to it.
+	// They get the matched user, target, and a fully-configured dialer
+	// (egress / DNS / TFO already baked in) and return either a (maybe
+	// metering-wrapped) upstream conn, or a hard reject error.
+	//
+	// When OnAuthorize is nil — i.e., standalone OpenSnell or single-
+	// user mode — we dial directly with the server's own dialer. No
+	// behavior change from before multi-user support was added.
 	dialer := s.dialer()
-	upstream, derr := dialer.DialContext(ctx, s.outboundNetwork("tcp"), target)
-	if derr != nil {
-		s.logger.Warn("upstream dial failed", "target", target, "err", derr)
-		if werr := writeServerError(stream, errnoOf(derr), derr.Error()); werr != nil {
+	var upstream net.Conn
+	if s.cfg.OnAuthorize != nil {
+		netw := s.outboundNetwork("tcp")
+		upstream, err = s.cfg.OnAuthorize(ctx, ConnContext{
+			User:       user,
+			RemoteAddr: remote,
+			Target:     target,
+			Command:    CommandConnect,
+			Reuse:      reuse,
+		}, networkBindingDialer{base: dialer, network: netw})
+	} else {
+		upstream, err = dialer.DialContext(ctx, s.outboundNetwork("tcp"), target)
+	}
+	if err != nil {
+		s.logger.Warn("upstream dial failed", "target", target, "err", err, "user", user)
+		if werr := writeServerError(stream, errnoOf(err), err.Error()); werr != nil {
 			return false, werr
 		}
 		return reuse, nil
@@ -735,6 +860,30 @@ func errnoOf(err error) byte {
 		return byte(sce)
 	}
 	return 0
+}
+
+// networkBindingDialer adapts the server's net.Dialer to the
+// ContextDialer interface exposed in OnAuthorize, applying the server's
+// IPv6/v4-only network override transparently so callers don't have to
+// know about it. "tcp" / "udp" get rewritten to "tcp4" / "udp4" when
+// cfg.IPv6 is false, matching the in-server dial path.
+type networkBindingDialer struct {
+	base    net.Dialer
+	network string // already-resolved network family ("tcp", "tcp4", ...)
+}
+
+func (d networkBindingDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	// Honor whatever family the caller asked for, but if they pass the
+	// generic "tcp" / "udp" we substitute the server-config-resolved
+	// one (so an IPv6-disabled server stays IPv6-disabled).
+	if network == "tcp" || network == "udp" {
+		// Use the server-resolved family when it's strictly tighter
+		// than the caller's; otherwise pass through.
+		if d.network != "" && d.network != network {
+			network = d.network
+		}
+	}
+	return d.base.DialContext(ctx, network, addr)
 }
 
 // addrCache is a tiny LRU-ish cache. We do not need real LRU semantics for

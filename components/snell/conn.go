@@ -6,6 +6,7 @@
 package snell
 
 import (
+	"crypto/cipher"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -129,6 +130,22 @@ func StreamConn(conn net.Conn, psk []byte) *Snell {
 // pre-set so a subsequent Read returns the client's first request bytes.
 func ServerStreamConn(conn net.Conn, psk []byte) *Snell {
 	s := StreamConn(conn, psk)
+	s.reply = true
+	return s
+}
+
+// ServerStreamConnPrefilled is the multi-user variant of ServerStreamConn.
+// The caller has already done the salt-read + 23-byte trial-decrypt
+// during user identification, so we wire that pre-derived AEAD straight
+// into the v4 reader and replay the consumed header bytes back to it.
+//
+//   - readAEAD: AEAD already keyed for (matchedUser.PSK, prefetchedSalt)
+//   - prefetchedHdr: the 23 bytes that auth consumed; the v4Reader will
+//     re-Open them with nonce 0, stepping its counter to 1 normally
+//   - writePSK: the matched user's PSK, used lazily to derive the
+//     server's response AEAD (which uses a fresh salt the server picks)
+func ServerStreamConnPrefilled(conn net.Conn, readAEAD cipher.AEAD, prefetchedHdr, writePSK []byte) *Snell {
+	s := &Snell{Conn: newV4ConnPrefilled(conn, readAEAD, prefetchedHdr, writePSK)}
 	s.reply = true
 	return s
 }

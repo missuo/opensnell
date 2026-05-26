@@ -9,6 +9,7 @@ package snell
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/cipher"
 	crand "crypto/rand"
 	"encoding/binary"
@@ -21,6 +22,10 @@ import (
 	"sync"
 	"time"
 )
+
+// bytesReader returns an io.Reader over a one-shot byte slice. Trivial
+// wrapper kept short to avoid the bytes import leaking into other files.
+func bytesReader(b []byte) io.Reader { return bytes.NewReader(b) }
 
 const (
 	v4SaltSize           = 16
@@ -44,6 +49,28 @@ type v4Conn struct {
 
 func newV4Conn(conn net.Conn, psk []byte) *v4Conn {
 	return &v4Conn{Conn: conn, psk: psk}
+}
+
+// newV4ConnPrefilled is the multi-user-mode constructor: the caller has
+// already (a) consumed the 16-byte salt and 23-byte AEAD header from the
+// wire during PSK trial-decryption, and (b) derived the read-side AEAD
+// from the matched user's PSK. We skip the salt-read entirely and feed
+// the 23-byte header back to the v4Reader via a MultiReader so its nonce
+// counter steps through the same Open() that auth already validated.
+//
+// writePSK is the matched user's PSK, used lazily on the first Write to
+// derive the response-side AEAD (response side has its own random salt).
+func newV4ConnPrefilled(conn net.Conn, readAEAD cipher.AEAD, prefetchedHdr, writePSK []byte) *v4Conn {
+	c := &v4Conn{Conn: conn, psk: writePSK}
+	var rdr io.Reader = conn
+	if len(prefetchedHdr) > 0 {
+		rdr = io.MultiReader(bytesReader(prefetchedHdr), conn)
+	}
+	c.r = &v4Reader{
+		Reader: bufio.NewReaderSize(rdr, 64*1024),
+		aead:   readAEAD,
+	}
+	return c
 }
 
 func (c *v4Conn) initReader() error {
