@@ -10,6 +10,13 @@ English | [简体中文](README_zh.md)
 > bypass/probe controls. If you only need Surge-compatible behavior, use
 > the `main` branch and its tagged releases. Use the `alpha` branch if you
 > specifically want the extra features documented here.
+>
+> The non-negotiable baseline for alpha development is that the
+> **OpenSnell server must remain compatible with the official Surge
+> client**. Server-side experiments may add implementation details,
+> operator hooks, or optional behavior, but they must not require a
+> modified client, change the published Snell wire format, or break the
+> standard Surge-client-to-OpenSnell-server path.
 
 A Go implementation of the Snell proxy protocol, versions **4** and **5** —
 server-side and client-side, with **end-to-end interoperability against the
