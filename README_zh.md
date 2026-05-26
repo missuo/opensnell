@@ -5,7 +5,8 @@
 > **你正在阅读 `alpha` 分支的 README。** 这个分支以
 > [`main`](https://github.com/missuo/opensnell/tree/main) 为基础，
 > 额外加入了官方 Surge `snell-server` **尚未提供**的实验性功能；目前主要是
-> `tcp-brutal` 拥塞控制。如果你只需要与 Surge 兼容的标准行为，请使用
+> 库/API 级多用户服务端模式、`tcp-brutal` 拥塞控制、TUN 入站、fake-IP DNS
+> 以及相关旁路/探测控制。如果你只需要与 Surge 兼容的标准行为，请使用
 > `main` 分支及其带标签的正式版本。只有在明确需要本文档说明的额外功能时，
 > 才建议使用 `alpha` 分支。
 
@@ -36,6 +37,7 @@ v1/v2 旧环境，同类项目 [open-snell](https://github.com/icpz/open-snell) 
 | `ipv6` 出站地址族开关（v5）           | ✅             | —              |
 | 自定义上游 DNS（`dns = …`）           | ✅             | —              |
 | TCP Fast Open（仅 Linux）             | ✅             | ✅             |
+| **多用户服务端模式（实验性，库/API）** | ✅             | 客户端使用各自 PSK |
 | **QUIC 代理模式（v5）**               | ✅             | 使用 Surge     |
 | **`tcp-brutal` 拥塞控制（实验性，仅 Linux）** | ✅     | ✅             |
 | **TUN 入站 + fake-IP DNS（实验性，Linux + macOS）** | — | ✅       |
@@ -66,9 +68,9 @@ bash <(curl -fsSL https://s.ee/opensnell)
 #### 安装 alpha 通道
 
 `alpha` 分支会在稳定版之前跟进实验性功能（目前包括 TUN 入站、fake-IP DNS、
-tcp-brutal 拥塞控制、自定义上游 DNS；这些都不是官方 Surge `snell-server`
-提供的功能）。CI 会在每次推送到该分支后发布一个滚动的 `alpha` 预发布版本；
-安装器可以通过 `--alpha` 拉取这个通道：
+tcp-brutal 拥塞控制、自定义上游 DNS，以及库/API 级多用户服务端模式；这些都不是
+官方 Surge `snell-server` 提供的功能）。CI 会在每次推送到该分支后发布一个滚动的
+`alpha` 预发布版本；安装器可以通过 `--alpha` 拉取这个通道：
 
 ```sh
 bash <(curl -fsSL https://s.ee/opensnell) install --alpha
@@ -114,6 +116,10 @@ listen = 0.0.0.0:2333
 ; 预共享密钥。必填。按原始 UTF-8 字符串处理（不会进行 base64 解码），
 ; 客户端必须配置完全相同的值。
 psk = your-shared-secret
+
+; 独立运行的 snell-server 目前仍然从这个 INI 文件读取单个 PSK。
+; Alpha 的多用户模式通过 Go 库 API（`ServerConfig.UserStore`）暴露，
+; 面向面板和嵌入式集成；CLI 配置加载器不会解析 [users] 段。
 
 ; 包裹 snell 流的混淆层。可选，默认关闭。
 ;   off  — 不启用混淆（推荐；v4/v5 帧格式已经通过逐帧 padding
@@ -202,6 +208,58 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 ```
+
+### 实验性：多用户服务端模式（库/API）
+
+Alpha 可以在不改变 Snell 线路格式的前提下，让同一个服务端接受多个独立用户 PSK。
+这个能力主要面向面板和嵌入式集成，用于按用户计费、限额、限速或轮换密钥。
+
+独立的 `cmd/snell-server` 仍然只读取上文的单个 `psk = ...` 配置。只有在代码中嵌入
+`components/snell` 并设置 `ServerConfig.UserStore` 时，才会进入多用户模式。
+
+```go
+store := snell.NewStaticUserStore([]snell.User{
+	{Name: "panel-user-1", PSK: []byte("user-1-random-psk")},
+	{Name: "panel-user-2", PSK: []byte("user-2-random-psk")},
+})
+
+srv, err := snell.NewServer(snell.ServerConfig{
+	Listen:    "0.0.0.0:2333",
+	UserStore: store,
+	ObfsMode:  "off",
+	UDP:       true,
+	QUIC:      true,
+	OnAuthorize: func(ctx context.Context, info snell.ConnContext, dialer snell.ContextDialer) (net.Conn, error) {
+		if quotaExceeded(info.User) {
+			return nil, errors.New("quota exceeded")
+		}
+		return dialer.DialContext(ctx, "tcp", info.Target)
+	},
+}, logger)
+```
+
+Snell 在线路上没有用户名或 key hint。服务端的识别方式是读取第一段 16 字节 salt
+和第一段 23 字节 AEAD 加密帧头，然后用当前用户快照里的每个 PSK 尝试解密。只有
+AES-GCM 成功打开，且明文帧标记是 `0x04` 时，才认为该用户匹配。匹配后，服务端会复用
+已经派生出的读侧 AEAD，并把预先读取的帧头重新喂给普通 v4 reader，因此 nonce 推进方式
+与单 PSK 路径完全一致。
+
+冷启动认证的成本是 O(N)，N 是当前用户数。为避免每条连接都全表扫描，认证器维护一个
+4096 项的 client-IP -> user-index 缓存。命中时只需要一次 Argon2id 派生和一次
+AES-GCM open，成本与单用户快路径相同；缓存过期或用户列表调整后会回退到全表扫描，
+不会把错误用户放行。空用户表会 fail closed；认证失败前会固定 sleep 50 ms，以降低计时信号。
+
+`OnAuthorize` 会在 TCP CONNECT / CONNECT reuse 已经识别出用户和目标后调用。它会收到
+`ConnContext.User`、客户端远端地址、目标 `host:port`，以及一个已经继承服务端
+egress-interface、IPv6、自定义 DNS 和 TFO 设置的 dialer。返回包装后的连接可用于流量统计
+或限速；返回 `(nil, error)` 会拒绝请求，并向客户端写回 Snell error response。
+
+v5 QUIC 信封路径也会使用同一个用户表，并在每条新 QUIC flow 的日志里记录匹配用户。
+UDP-over-TCP 也会先经过同一条 stream 级 PSK 认证。当前还没有给 QUIC 和 UDP relay 暴露
+按用户执行策略的 hook。
+
+每个用户都必须使用唯一 PSK。如果两个用户配置了相同 PSK，当前快照中第一个匹配项会获胜，
+流量归属将无法可靠判断。
 
 ## 客户端配置
 

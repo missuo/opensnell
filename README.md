@@ -5,10 +5,11 @@ English | [简体中文](README_zh.md)
 > **You are reading the `alpha` branch README.** This branch tracks
 > [`main`](https://github.com/missuo/opensnell/tree/main) and layers
 > experimental features that the official Surge `snell-server` does NOT
-> ship — right now that means `tcp-brutal` congestion control. If you only
-> need Surge-compatible behavior, use the `main` branch and its tagged
-> releases. Use the `alpha` branch if you specifically want the extra
-> features documented here.
+> ship — right now that means library-level multi-user server mode,
+> `tcp-brutal` congestion control, TUN inbound, fake-IP DNS, and related
+> bypass/probe controls. If you only need Surge-compatible behavior, use
+> the `main` branch and its tagged releases. Use the `alpha` branch if you
+> specifically want the extra features documented here.
 
 A Go implementation of the Snell proxy protocol, versions **4** and **5** —
 server-side and client-side, with **end-to-end interoperability against the
@@ -43,6 +44,7 @@ the current Surge `snell-server` speaks.
 | `ipv6` outbound family toggle (v5)    | ✅             | —              |
 | Custom upstream DNS (`dns = …`)       | ✅             | —              |
 | TCP Fast Open (Linux only)            | ✅             | ✅             |
+| **Multi-user server mode (experimental, library API)** | ✅ | client uses per-user PSK |
 | **QUIC proxy mode (v5)**              | ✅             | use Surge      |
 | **`tcp-brutal` CC (experimental, Linux only)** | ✅    | ✅             |
 | **TUN inbound with fake-IP DNS (experimental, Linux + macOS)** | — | ✅      |
@@ -74,9 +76,10 @@ The interactive installer:
 
 The `alpha` branch tracks experimental features ahead of stable
 release (currently: TUN inbound, fake-IP DNS, tcp-brutal CC, custom
-upstream DNS — none of which the official Surge `snell-server`
-ships). CI publishes a rolling pre-release tagged `alpha` on every
-push to that branch; the installer can pull from it via `--alpha`:
+upstream DNS, and library-level multi-user server mode — none of which
+the official Surge `snell-server` ships). CI publishes a rolling
+pre-release tagged `alpha` on every push to that branch; the installer
+can pull from it via `--alpha`:
 
 ```sh
 bash <(curl -fsSL https://s.ee/opensnell) install --alpha
@@ -124,6 +127,11 @@ listen = 0.0.0.0:2333
 ; Pre-shared key. Required. Treated as a raw UTF-8 string (NOT base64
 ; decoded) — keep this exactly as configured on the client side.
 psk = your-shared-secret
+
+; Standalone snell-server currently uses one PSK from this INI file.
+; Alpha's multi-user mode is exposed through the Go library API
+; (`ServerConfig.UserStore`) for panels and embedders; the CLI loader
+; does not parse a [users] section.
 
 ; Obfuscation layer wrapping the snell stream. Optional, default off.
 ;   off  — no obfuscation (recommended; the v4/v5 frame format already
@@ -218,6 +226,69 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 ```
+
+### EXPERIMENTAL: multi-user server mode (library API)
+
+Alpha can authenticate multiple independent user PSKs on one server
+without changing the Snell wire format. This is intended for panels or
+embedders that need per-user accounting, quotas, or key rotation.
+
+The standalone `cmd/snell-server` still reads the single `psk = ...`
+setting shown above. Multi-user mode is enabled only when code embeds
+`components/snell` and sets `ServerConfig.UserStore`.
+
+```go
+store := snell.NewStaticUserStore([]snell.User{
+	{Name: "panel-user-1", PSK: []byte("user-1-random-psk")},
+	{Name: "panel-user-2", PSK: []byte("user-2-random-psk")},
+})
+
+srv, err := snell.NewServer(snell.ServerConfig{
+	Listen:    "0.0.0.0:2333",
+	UserStore: store,
+	ObfsMode:  "off",
+	UDP:       true,
+	QUIC:      true,
+	OnAuthorize: func(ctx context.Context, info snell.ConnContext, dialer snell.ContextDialer) (net.Conn, error) {
+		if quotaExceeded(info.User) {
+			return nil, errors.New("quota exceeded")
+		}
+		return dialer.DialContext(ctx, "tcp", info.Target)
+	},
+}, logger)
+```
+
+Snell carries no username or key hint on the wire. The server identifies
+the user by reading the first 16-byte salt plus the first 23-byte
+AEAD-sealed frame header, then trial-decrypting that header against the
+current user snapshot. A user matches only when AES-GCM opens cleanly
+and the plaintext frame marker is `0x04`. On success, the server reuses
+the derived read AEAD and feeds the consumed header back through the
+normal v4 reader, so nonce handling stays identical to the single-PSK
+path.
+
+Cold authentication is O(N) in the number of users, so the authenticator
+keeps a 4096-entry client-IP -> user-index cache. A cache hit costs one
+Argon2id derivation and one AES-GCM open, matching the single-user fast
+path; stale cache entries fall back to a full scan and never authorize
+the wrong user. Empty stores fail closed, and failed authentication
+sleeps for 50 ms before returning to reduce timing signal.
+
+`OnAuthorize` is called for TCP CONNECT / CONNECT reuse after the user
+and target are known. It receives `ConnContext.User`, the client's
+remote address, the target `host:port`, and a dialer that already
+inherits the server's egress-interface, IPv6, custom DNS, and TFO
+settings. Returning a wrapped connection lets the embedder meter or
+rate-limit traffic; returning `(nil, error)` rejects the request.
+
+The v5 QUIC envelope path also uses the user store and logs the matched
+user for each new QUIC flow. UDP-over-TCP is authenticated by the same
+stream-level PSK match. Per-user policy hooks for QUIC and UDP relay are
+not exposed yet.
+
+Every user must have a unique PSK. If two users share a PSK, the first
+matching entry in the current snapshot wins and traffic cannot be
+attributed reliably.
 
 ## Client configuration
 
