@@ -239,6 +239,33 @@ func (s *Server) buildResolver() *net.Resolver {
 	}
 }
 
+// normalizeListenAddr accepts the bracketless IPv6 "host:port" form that the
+// official snell-server allows (e.g. `listen = ::0:2333`) and rewrites it into
+// the bracketed form Go's net package requires (`[::0]:2333`). Anything that
+// already parses cleanly — IPv4 `0.0.0.0:2333`, bracketed `[::]:2333`, or a
+// bare `:2333` — is returned untouched, as is anything we can't confidently
+// interpret (so net.Listen still surfaces a natural error).
+func normalizeListenAddr(addr string) string {
+	if addr == "" {
+		return addr
+	}
+	// Already valid (IPv4 host:port, [v6]:port, or :port)? Leave it alone.
+	if _, _, err := net.SplitHostPort(addr); err == nil {
+		return addr
+	}
+	// A bracketless IPv6 address with a port has its port after the final
+	// colon; everything before it must parse as an IPv6 literal.
+	i := strings.LastIndex(addr, ":")
+	if i <= 0 {
+		return addr
+	}
+	host, port := addr[:i], addr[i+1:]
+	if port == "" || net.ParseIP(host) == nil {
+		return addr
+	}
+	return net.JoinHostPort(host, port)
+}
+
 func NewServer(cfg ServerConfig, logger *slog.Logger) (*Server, error) {
 	if cfg.PSK == "" && cfg.UserStore == nil {
 		return nil, errors.New("snell server requires psk or user store")
@@ -254,6 +281,7 @@ func NewServer(cfg ServerConfig, logger *slog.Logger) (*Server, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	cfg.Listen = normalizeListenAddr(cfg.Listen)
 	s := &Server{cfg: cfg, psk: []byte(cfg.PSK), logger: logger}
 	if cfg.UserStore != nil {
 		s.auth = newMultiUserAuth(cfg.UserStore)
