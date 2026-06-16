@@ -16,8 +16,9 @@
 # Three install variants:
 #   1) OpenSnell (default, GPLv3, all-platform, this repo)
 #   2) Surge official snell-server v5.0.1 (closed-source, Linux only)
-#   3) Surge official snell-server v6.0.0b2 (closed-source beta, Linux only,
-#      protocol v6; statically linked — no extra shared libraries needed)
+#   3) Surge official snell-server v6.0.0b3 (closed-source beta, Linux only,
+#      protocol v6; statically linked — no extra shared libraries needed;
+#      adds the `mode` directive: default / unshaped / unsafe-raw)
 #
 # Project: https://github.com/missuo/opensnell
 # SPDX-License-Identifier: GPL-3.0-or-later
@@ -50,7 +51,7 @@ SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 OPENSNELL_REPO="missuo/opensnell"
 OPENSNELL_RELEASE_API="https://api.github.com/repos/${OPENSNELL_REPO}/releases/latest"
 SURGE_V5_VERSION="v5.0.1"
-SURGE_V6_VERSION="v6.0.0b2"
+SURGE_V6_VERSION="v6.0.0b3"
 SURGE_BASE_URL="https://dl.nssurge.com/snell"
 
 # ============================================================================
@@ -240,10 +241,13 @@ generate_node_name() {
 }
 
 # Make sure the kernel has TFO fully enabled (bit 0 + bit 1 = 3).
-# If the running kernel already reports 3, we DON'T touch the user's
-# system — we only write `tfo = true` to opensnell.conf and trust the
-# kernel. We only edit /etc/sysctl.conf when the kernel is missing one
-# of the bits, and even then we keep the edit minimal (sed-or-append).
+# The server itself (OpenSnell, or the official Surge binary — verified to
+# setsockopt(SOL_TCP, TCP_FASTOPEN) on its listener in both v5.0.1 and
+# v6.0.0b3) opens the socket with TFO; this sysctl is the kernel gate that
+# makes the server bit actually engage. If the running kernel already reports
+# 3 we DON'T touch the user's system. We only edit /etc/sysctl.conf when the
+# kernel is missing one of the bits, and even then we keep the edit minimal
+# (sed-or-append).
 enable_tfo_sysctl() {
     local current
     current=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo "")
@@ -257,7 +261,7 @@ enable_tfo_sysctl() {
     local confirm
     confirm=$(prompt_yesno "Set it to 3 (will write to /etc/sysctl.conf and apply via sysctl -p)" "y")
     if [ "$confirm" != "y" ]; then
-        print_warning "Skipping; OpenSnell will still set the socket option, but TFO won't actually take effect"
+        print_warning "Skipping; the server will still set the socket option, but TFO won't actually take effect"
         return 0
     fi
 
@@ -358,22 +362,25 @@ download_opensnell() {
     echo "proto=5"           >> "$META_FILE.tmp"
 }
 
-# About v6.0.0b2 (measured, not theoretical): v6 adds a PSK-derived per-frame
+# About v6.0.0b3 (measured, not theoretical): v6 adds a PSK-derived per-frame
 # traffic-shaping layer (a padding keystream + padding↔ciphertext interleave on
 # top of AES-GCM) for anti-fingerprinting. b2 fixed the two big drawbacks of the
 # b1 beta: it is statically linked (no extra shared libraries) and multi-core
 # (SO_REUSEPORT + io_uring workers), so it no longer saturates a single core — it
 # reaches the ~52 MB/s co-located link ceiling at ~10% CPU, where b1 capped at
-# ~30 MB/s burning one core. It is still a closed-source beta, so for maximum
-# stability OpenSnell (option 1) or Surge v5.0.1 (option 2) remain the safe picks.
+# ~30 MB/s burning one core. b3 adds the `mode` directive — `default` (obfs +
+# AES, unchanged), `unshaped` (AES only, no shaping: ~10% more throughput, wire
+# looks fully random like v3), and `unsafe-raw` (plaintext, no crypto — trusted
+# tunnels only). It is still a closed-source beta, so for maximum stability
+# OpenSnell (option 1) or Surge v5.0.1 (option 2) remain the safe picks.
 note_v6_beta() {
     print_warning "snell-server ${SURGE_V6_VERSION} is a closed-source BETA."
     print_info  "v6 adds a PSK-derived per-frame traffic-shaping layer (anti-fingerprinting)."
-    print_info  "b2 fixed b1's drawbacks: statically linked (no extra libs) and multi-core,"
-    print_info  "so it reaches the link ceiling at ~10% CPU (b1 capped one core at ~30 MB/s)."
+    print_info  "b2 made it statically linked (no extra libs) and multi-core; b3 adds the"
+    print_info  "\`mode\` directive (default / unshaped / unsafe-raw) — you'll pick one next."
     print_info  "For maximum stability, OpenSnell (option 1) or Surge ${SURGE_V5_VERSION} (option 2) are safe picks."
     local go_on
-    go_on=$(prompt_yesno "Install v6.0.0b2?" "y")
+    go_on=$(prompt_yesno "Install ${SURGE_V6_VERSION}?" "y")
     if [ "$go_on" != "y" ]; then
         print_info "Aborted. Re-run and pick option 1 or 2."
         exit 0
@@ -381,7 +388,7 @@ note_v6_beta() {
 }
 
 download_surge() {
-    # download_surge <version>, e.g. "v5.0.1" or "v6.0.0b2".
+    # download_surge <version>, e.g. "v5.0.1" or "v6.0.0b3".
     local version="$1" proto="5"
     case "$version" in v6*) proto="6" ;; esac
 
@@ -416,7 +423,7 @@ download_surge() {
     print_success "Installed Surge snell-server ${version} → ${INSTALL_BIN}"
 
     if [ "$proto" = "6" ]; then
-        # v6.0.0b2 is statically linked, so no shared-library setup is needed.
+        # v6.0.0b3 is statically linked, so no shared-library setup is needed.
         # It is UPX-packed (ldd can't enumerate it), so the reliable check is to
         # actually execute it.
         if "$INSTALL_BIN" -v >/dev/null 2>&1; then
@@ -479,6 +486,26 @@ build_config() {
         fi
     fi
 
+    # --- mode (v6.0.0b3+ only) ---
+    # default    : obfuscation + AES encryption (the canonical mode; omittable).
+    # unshaped   : AES only, no traffic shaping — ~10% more throughput; the wire
+    #              looks fully random, equivalent to Snell v3.
+    # unsafe-raw : no encryption AND no shaping — plaintext. Only safe inside a
+    #              trusted intranet or wrapped in another secure tunnel.
+    # The client MUST be configured with the same mode or the connection fails.
+    local mode="default"
+    if [ "$proto" = "6" ]; then
+        mode=$(prompt_default "Traffic mode (default/unshaped/unsafe-raw)" "default")
+        case "$mode" in
+            default|unshaped) ;;
+            unsafe-raw)
+                print_warning "unsafe-raw forwards ALL traffic in PLAINTEXT — no encryption, no obfs."
+                print_warning "Only use it inside a trusted intranet or another secure tunnel."
+                ;;
+            *) print_error "mode must be one of: default, unshaped, unsafe-raw"; exit 1 ;;
+        esac
+    fi
+
     # --- obfs (removed in v6; the v6 server silently ignores it) ---
     local obfs="off"
     if [ "$proto" != "6" ]; then
@@ -503,7 +530,7 @@ build_config() {
         if [ "$ipv6_choice" = "y" ]; then ipv6="true"; else ipv6="false"; fi
     fi
 
-    # OpenSnell-only knobs
+    # Per-variant knobs.
     local udp="true" quic="true" egress="" tfo="false"
     if [ "$variant" = "opensnell" ]; then
         local udp_choice quic_choice tfo_choice
@@ -517,19 +544,34 @@ build_config() {
 
         tfo_choice=$(prompt_yesno "Enable TCP Fast Open (saves 1 RTT per fresh connection; Linux only)" "n")
         [ "$tfo_choice" = "y" ] && tfo="true"
-    elif [ "$proto" = "6" ]; then
-        # The official v6 server grew its own egress-interface directive.
-        egress=$(prompt_default "Egress interface to pin upstream sockets to (leave blank for default route)" "")
+    else
+        # Official Surge variant (v5 or v6). The official binary ALWAYS sets
+        # TCP_FASTOPEN on its listener (verified via strace on both v5.0.1 and
+        # v6.0.0b3: setsockopt(SOL_TCP, TCP_FASTOPEN) right before listen()),
+        # so there is no server-side config knob — the listener TFO is built in.
+        # It only pays off once the host kernel has the server bit set, so we
+        # default to flipping net.ipv4.tcp_fastopen=3 and advertising tfo=true
+        # to clients.
+        if [ "$proto" = "6" ]; then
+            # The official v6 server grew its own egress-interface directive.
+            egress=$(prompt_default "Egress interface to pin upstream sockets to (leave blank for default route)" "")
+        fi
+        local tfo_choice
+        tfo_choice=$(prompt_yesno "Enable TCP Fast Open (the official server already listens with it; this sets the host kernel switch and adds tfo=true to your client config)" "y")
+        [ "$tfo_choice" = "y" ] && tfo="true"
     fi
 
     # --- Write config ---
     if [ "$proto" = "6" ]; then
         # Canonical v6 layout (what `snell-server --wizard` generates):
         # obfs is gone and ipv6 is deprecated, replaced by dns-ip-preference.
+        # `mode` is new in v6.0.0b3 (default when omitted, but we write it
+        # explicitly so the generated config documents the choice).
         cat > "$CONFIG_FILE" <<EOF
 [snell-server]
 listen = 0.0.0.0:${port}
 psk = ${psk}
+mode = ${mode}
 dns-ip-preference = ${dns_pref}
 EOF
         [ -n "$dns_servers" ] && echo "dns = ${dns_servers}"        >> "$CONFIG_FILE"
@@ -552,9 +594,11 @@ EOF
         fi
     fi
 
-    # Surge has its own per-proxy tfo=true, which our snell-server happily
-    # ignores when running as the Surge variant. So TFO config is OpenSnell-only.
-    if [ "$variant" = "opensnell" ] && [ "$tfo" = "true" ]; then
+    # Every supported server (OpenSnell and the official Surge binary) opens
+    # its listener with the TFO socket option; net.ipv4.tcp_fastopen is the
+    # kernel gate that makes the server bit engage. Apply it whenever this
+    # install opted into TFO, regardless of variant.
+    if [ "$tfo" = "true" ]; then
         enable_tfo_sysctl
     fi
     chmod 600 "$CONFIG_FILE"
@@ -573,12 +617,13 @@ EOF
     # --- Persist meta ---
     if [ -f "$META_FILE.tmp" ]; then mv "$META_FILE.tmp" "$META_FILE"; fi
     {
-        grep -vE '^(port|psk|obfs|ipv6|tfo|dns_pref|node_name|geo_ip|geo_country)=' "$META_FILE" 2>/dev/null || true
+        grep -vE '^(port|psk|obfs|ipv6|tfo|mode|dns_pref|node_name|geo_ip|geo_country)=' "$META_FILE" 2>/dev/null || true
         echo "port=$port"
         echo "psk=$psk"
         echo "obfs=$obfs"
         echo "ipv6=$ipv6"
         echo "tfo=$tfo"
+        echo "mode=$mode"
         echo "dns_pref=$dns_pref"
         echo "node_name=$node_name"
         echo "geo_ip=$GEO_IP"
@@ -657,7 +702,7 @@ show_info() {
         print_warning "No installation metadata found; is the server installed?"
         return 1
     fi
-    local variant version proto port psk obfs ipv6 tfo dns_pref node_name geo_ip ip
+    local variant version proto port psk obfs ipv6 tfo mode dns_pref node_name geo_ip ip
     variant=$(grep   '^variant='     "$META_FILE" | cut -d= -f2-)
     version=$(grep   '^version='     "$META_FILE" | cut -d= -f2-)
     proto=$(grep     '^proto='       "$META_FILE" | cut -d= -f2-)
@@ -666,6 +711,7 @@ show_info() {
     obfs=$(grep      '^obfs='        "$META_FILE" | cut -d= -f2-)
     ipv6=$(grep      '^ipv6='        "$META_FILE" | cut -d= -f2-)
     tfo=$(grep       '^tfo='         "$META_FILE" | cut -d= -f2-)
+    mode=$(grep      '^mode='        "$META_FILE" | cut -d= -f2-)
     dns_pref=$(grep  '^dns_pref='    "$META_FILE" | cut -d= -f2-)
     node_name=$(grep '^node_name='   "$META_FILE" | cut -d= -f2-)
     geo_ip=$(grep    '^geo_ip='      "$META_FILE" | cut -d= -f2-)
@@ -697,7 +743,9 @@ show_info() {
     echo -e "${BOLD}Port:${NC}         ${port}"
     echo -e "${BOLD}PSK:${NC}          ${psk}"
     if [ "$proto" = "6" ]; then
+        echo -e "${BOLD}Mode:${NC}         ${mode:-default}"
         echo -e "${BOLD}DNS pref:${NC}     ${dns_pref:-default}"
+        echo -e "${BOLD}TFO:${NC}          ${tfo}"
     else
         echo -e "${BOLD}obfs:${NC}         ${obfs}"
         echo -e "${BOLD}IPv6 egress:${NC}  ${ipv6}"
@@ -713,12 +761,13 @@ show_info() {
     echo -e "${GREEN}${node_name} = snell, ${ip}, ${port}, psk=\"${psk}\", version=${proto}${tfo_param}${NC}"
 
     print_header "Mihomo proxy (copy into proxies)"
-    local mihomo_name mihomo_server mihomo_psk
+    local mihomo_name mihomo_server mihomo_psk mihomo_tfo=""
     mihomo_name=$(yaml_double_quote_escape "$node_name")
     mihomo_server=$(yaml_double_quote_escape "$ip")
     mihomo_psk=$(yaml_double_quote_escape "$psk")
-    printf '%b- {name: "%s", server: "%s", port: %s, type: snell, psk: "%s", version: %s}%b\n' \
-        "$GREEN" "$mihomo_name" "$mihomo_server" "$port" "$mihomo_psk" "$proto" "$NC"
+    [ "$tfo" = "true" ] && mihomo_tfo=", tfo: true"
+    printf '%b- {name: "%s", server: "%s", port: %s, type: snell, psk: "%s", version: %s%s}%b\n' \
+        "$GREEN" "$mihomo_name" "$mihomo_server" "$port" "$mihomo_psk" "$proto" "$mihomo_tfo" "$NC"
 
     print_header "Shadowrocket URL"
     local shadowrocket_payload shadowrocket_name shadowrocket_tfo
@@ -727,6 +776,15 @@ show_info() {
     if [ "$tfo" = "true" ]; then shadowrocket_tfo="1"; else shadowrocket_tfo="0"; fi
     printf '%bsnell://%s?tfo=%s&version=%s#%s%b\n' \
         "$GREEN" "$shadowrocket_payload" "$shadowrocket_tfo" "$proto" "$shadowrocket_name" "$NC"
+
+    # v6's `mode` changes the wire format, so a non-default server mode only
+    # works with a client set to the same mode. The lines above carry no mode
+    # token (clients infer `default`); flag the mismatch instead of silently
+    # printing a config that won't connect.
+    if [ "$proto" = "6" ] && [ -n "$mode" ] && [ "$mode" != "default" ]; then
+        print_warning "Server mode is '${mode}', not 'default' — set the SAME mode on the client,"
+        print_warning "or the handshake will fail. The proxy lines above assume the client's mode matches."
+    fi
 
     print_header "Service"
     systemctl is-active --quiet "$SERVICE_NAME" \
