@@ -16,7 +16,7 @@
 # Three install variants:
 #   1) OpenSnell (default, GPLv3, all-platform, this repo)
 #   2) Surge official snell-server v5.0.1 (closed-source, Linux only)
-#   3) Surge official snell-server v6.0.0b3 (closed-source beta, Linux only,
+#   3) Surge official snell-server v6.0.0b4 (closed-source beta, Linux only,
 #      protocol v6; statically linked — no extra shared libraries needed;
 #      adds the `mode` directive: default / unshaped / unsafe-raw)
 #
@@ -51,7 +51,7 @@ SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 OPENSNELL_REPO="missuo/opensnell"
 OPENSNELL_RELEASE_API="https://api.github.com/repos/${OPENSNELL_REPO}/releases/latest"
 SURGE_V5_VERSION="v5.0.1"
-SURGE_V6_VERSION="v6.0.0b3"
+SURGE_V6_VERSION="v6.0.0b4"
 SURGE_BASE_URL="https://dl.nssurge.com/snell"
 
 # ============================================================================
@@ -362,7 +362,7 @@ download_opensnell() {
     echo "proto=5"           >> "$META_FILE.tmp"
 }
 
-# About v6.0.0b3 (measured, not theoretical): v6 adds a PSK-derived per-frame
+# About v6.0.0b4 (measured, not theoretical): v6 adds a PSK-derived per-frame
 # traffic-shaping layer (a padding keystream + padding↔ciphertext interleave on
 # top of AES-GCM) for anti-fingerprinting. b2 fixed the two big drawbacks of the
 # b1 beta: it is statically linked (no extra shared libraries) and multi-core
@@ -371,13 +371,15 @@ download_opensnell() {
 # ~30 MB/s burning one core. b3 adds the `mode` directive — `default` (obfs +
 # AES, unchanged), `unshaped` (AES only, no shaping: ~10% more throughput, wire
 # looks fully random like v3), and `unsafe-raw` (plaintext, no crypto — trusted
-# tunnels only). It is still a closed-source beta, so for maximum stability
-# OpenSnell (option 1) or Surge v5.0.1 (option 2) remain the safe picks.
+# tunnels only). b4 fixes UDP-forwarding edge cases, bumps deps, and drops the
+# UPX shell that broke some environments. It is still a closed-source beta, so
+# for maximum stability OpenSnell (option 1) or Surge v5.0.1 (option 2) remain
+# the safe picks.
 note_v6_beta() {
     print_warning "snell-server ${SURGE_V6_VERSION} is a closed-source BETA."
     print_info  "v6 adds a PSK-derived per-frame traffic-shaping layer (anti-fingerprinting)."
-    print_info  "b2 made it statically linked (no extra libs) and multi-core; b3 adds the"
-    print_info  "\`mode\` directive (default / unshaped / unsafe-raw) — you'll pick one next."
+    print_info  "b2: static + multi-core; b3: \`mode\` (default / unshaped / unsafe-raw);"
+    print_info  "b4: UDP fixes, dep bumps, no UPX shell — you'll pick a mode next."
     print_info  "For maximum stability, OpenSnell (option 1) or Surge ${SURGE_V5_VERSION} (option 2) are safe picks."
     local go_on
     go_on=$(prompt_yesno "Install ${SURGE_V6_VERSION}?" "y")
@@ -388,7 +390,7 @@ note_v6_beta() {
 }
 
 download_surge() {
-    # download_surge <version>, e.g. "v5.0.1" or "v6.0.0b3".
+    # download_surge <version>, e.g. "v5.0.1" or "v6.0.0b4".
     local version="$1" proto="5"
     case "$version" in v6*) proto="6" ;; esac
 
@@ -423,7 +425,7 @@ download_surge() {
     print_success "Installed Surge snell-server ${version} → ${INSTALL_BIN}"
 
     if [ "$proto" = "6" ]; then
-        # v6.0.0b3 is statically linked, so no shared-library setup is needed.
+        # v6 (b2+) is statically linked, so no shared-library setup is needed.
         # It is UPX-packed (ldd can't enumerate it), so the reliable check is to
         # actually execute it.
         if "$INSTALL_BIN" -v >/dev/null 2>&1; then
