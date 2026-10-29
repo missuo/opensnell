@@ -16,8 +16,8 @@
 # Three install variants:
 #   1) OpenSnell (default, GPLv3, all-platform, this repo)
 #   2) Surge official snell-server v5.0.1 (closed-source, Linux only)
-#   3) Surge official snell-server v6.0.0rc2 (closed-source release candidate,
-#      Linux only, protocol v6; statically linked — no extra shared libraries
+#   3) Surge official snell-server v6.0.0 (closed-source, Linux only,
+#      protocol v6; statically linked — no extra shared libraries
 #      needed; adds the `mode` directive: default / unshaped / unsafe-raw)
 #
 # Project: https://github.com/missuo/opensnell
@@ -51,7 +51,7 @@ SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 OPENSNELL_REPO="missuo/opensnell"
 OPENSNELL_RELEASE_API="https://api.github.com/repos/${OPENSNELL_REPO}/releases/latest"
 SURGE_V5_VERSION="v5.0.1"
-SURGE_V6_VERSION="v6.0.0rc2"
+SURGE_V6_VERSION="v6.0.0"
 SURGE_BASE_URL="https://dl.nssurge.com/snell"
 
 # ============================================================================
@@ -362,7 +362,7 @@ download_opensnell() {
     echo "proto=5"           >> "$META_FILE.tmp"
 }
 
-# About v6.0.0rc2 (measured, not theoretical): v6 adds a PSK-derived per-frame
+# About v6.0.0 (measured, not theoretical): v6 adds a PSK-derived per-frame
 # traffic-shaping layer (a padding keystream + padding↔ciphertext interleave on
 # top of AES-GCM) for anti-fingerprinting. b2 fixed the two big drawbacks of the
 # b1 beta: it is statically linked (no extra shared libraries) and multi-core
@@ -372,11 +372,12 @@ download_opensnell() {
 # AES, unchanged), `unshaped` (AES only, no shaping: ~10% more throughput, wire
 # looks fully random like v3), and `unsafe-raw` (plaintext, no crypto — trusted
 # tunnels only). b4 fixes UDP-forwarding edge cases, bumps deps, and drops the
-# UPX shell that broke some environments. It is still a closed-source release
-# candidate, so for maximum stability OpenSnell (option 1) or Surge v5.0.1
-# (option 2) remain the safe picks.
+# UPX shell that broke some environments; rc/rc2 fix UDP-forwarding truncation
+# and add clearer errors. The final v6.0.0 is the rc2 binary promoted unchanged.
+# It is closed-source, so OpenSnell (option 1) or Surge v5.0.1 (option 2) remain
+# the safe picks for maximum stability.
 note_v6_beta() {
-    print_warning "snell-server ${SURGE_V6_VERSION} is a closed-source RELEASE CANDIDATE."
+    print_warning "snell-server ${SURGE_V6_VERSION} is closed-source (protocol v6)."
     print_info  "v6 adds a PSK-derived per-frame traffic-shaping layer (anti-fingerprinting)."
     print_info  "b2: static + multi-core; b3: \`mode\` (default / unshaped / unsafe-raw);"
     print_info  "b4/rc/rc2: UDP fixes, dep bumps, no UPX shell, clearer errors — pick a mode next."
@@ -478,12 +479,12 @@ build_config() {
         psk=$(gen_psk)
         print_info "Generated PSK: ${BOLD}${psk}${NC}"
     fi
-    # The v6 server hard-rejects PSKs outside 16..255 bytes at startup,
+    # The v6 server hard-rejects PSKs outside 12..255 bytes at startup,
     # so catch it here instead of leaving a service that won't boot.
     if [ "$proto" = "6" ]; then
         local psk_len; psk_len=$(printf '%s' "$psk" | wc -c | tr -d ' ')
-        if [ "$psk_len" -lt 16 ] || [ "$psk_len" -gt 255 ]; then
-            print_error "snell v6 requires a PSK between 16 and 255 bytes (got ${psk_len})."
+        if [ "$psk_len" -lt 12 ] || [ "$psk_len" -gt 255 ]; then
+            print_error "snell v6 requires a PSK between 12 and 255 bytes (got ${psk_len})."
             exit 1
         fi
     fi
@@ -804,7 +805,7 @@ do_install() {
     echo -e "${BOLD}Choose a variant:${NC}"
     echo -e "${GREEN}1)${NC} OpenSnell ${YELLOW}(default, GPLv3, all-platform)${NC}"
     echo -e "${GREEN}2)${NC} Surge official snell-server ${SURGE_V5_VERSION} ${YELLOW}(closed-source, Linux only)${NC}"
-    echo -e "${GREEN}3)${NC} Surge official snell-server ${SURGE_V6_VERSION} ${YELLOW}(closed-source release candidate, Linux only)${NC}"
+    echo -e "${GREEN}3)${NC} Surge official snell-server ${SURGE_V6_VERSION} ${YELLOW}(closed-source, Linux only)${NC}"
     echo
     read -r -p "$(echo -e "${CYAN}Variant [${BOLD}1${NC}${CYAN}]: ${NC}")" variant_choice
     case "${variant_choice:-1}" in
