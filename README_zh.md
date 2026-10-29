@@ -27,12 +27,12 @@ HTTP/3 加速，请将 OpenSnell 服务端搭配 **Surge** 客户端，或任何
 
 ### 那 Snell v6 呢？
 
-Snell v6（`snell-server v6.0.0b1` / `v6.0.0b2` / `v6.0.0b3` / `v6.0.0b4`）已被**完整逆向并用 Go 重新实现**——
+Snell v6（`snell-server v6.0.0b1` 到 `v6.0.0b4`、`v6.0.0rc`/`rc2`，以及正式版 `v6.0.0`）已被**完整逆向并用 Go 重新实现**——
 客户端与服务端都有——并且我们发出的帧在线路上与官方服务端**逐字节一致**（覆盖所有
 swap-mode 与 write-mode 的 24 个 PSK 上，逐帧 padding 100% 匹配，且每个都能完整互通），
 性能也与手写 C 的官方服务端持平。我们**选择不开源这套 v6 实现**。本仓库继续保持 v4/v5
 （GPLv3）；如果现在就想跑 v6，[安装脚本](#安装)可以部署**官方** Surge
-`snell-server v6.0.0b4`。完整说明见 [`SNELL_V6.md`](SNELL_V6.md)。
+`snell-server v6.0.0`。完整说明见 [`SNELL_V6.md`](SNELL_V6.md)。
 
 ## 功能矩阵
 
@@ -61,14 +61,14 @@ bash <(curl -fsSL https://s.ee/opensnell)
 
 - 让你选择 **OpenSnell**（默认，GPLv3，支持所有平台）、
   **官方 Surge `snell-server v5.0.1`** 或 **官方 Surge
-  `snell-server v6.0.0b4`** beta（均为闭源，仅 Linux）。
+  `snell-server v6.0.0`**（均为闭源，仅 Linux）。
 - 选择 v6 时会写入新版 v6 配置（`dns-ip-preference` 取代 `ipv6`，
-  `obfs` 已移除），客户端配置行输出 `version=6`。v6.0.0b4 是**静态链接**的，
+  `obfs` 已移除），客户端配置行输出 `version=6`。v6.0.0 是**静态链接**的，
   所以——不同于 b1 beta——不再需要安装任何额外的共享库。安装器还会询问
   **`mode`** 指令（见下方说明）。
 
 > [!NOTE]
-> **官方 `snell-server v6.0.0b4` 是闭源 beta。** Snell v6 引入了一层
+> **官方 `snell-server v6.0.0` 是闭源的。** Snell v6 引入了一层
 > PSK 派生的逐帧**流量整形**（一段 padding keystream，外加 padding↔密文
 > 交织，再叠加 AES-GCM），用于抗指纹。**b2 修好了让早期 b1 beta 不堪用的
 > 两件事：** 现在是**静态链接**（无需额外共享库）且**多核**
@@ -79,8 +79,10 @@ bash <(curl -fsSL https://s.ee/opensnell)
 > v3）、`unsafe-raw`（明文、无加密——仅限可信隧道内）。客户端必须设置为**相同**
 > 的 mode。**b4 是纯二进制更新——线路上与 b3 完全一致**（刷新依赖库、一处
 > UDP 转发的内部修复，并移除了 UPX 自解压壳，因此现在以未压缩形式发布，约 2.85 MB，
-> 仍为静态链接）：OpenSnell 无需任何改动即可与之互通，且版本号现在报告
-> `v6.0.0b4`。它仍是 beta，所以追求最高稳定性时优先选 **OpenSnell** 或
+> 仍为静态链接）。**rc/rc2** 修复了 UDP 转发开始时头几个包可能被截断的问题，
+> 并在客户端访问被 `dns-ip-preference` 禁用的 IP 族地址时返回清晰的报错。正式版
+> **v6.0.0** 就是原样转正的 rc2 二进制（sha256 相同），还支持逗号分隔的多个
+> `listen` 地址，并要求 PSK 为 12–255 字节。它是闭源的，所以追求最高稳定性时优先选 **OpenSnell** 或
 > **Surge v5.0.1**；安装器会在安装 v6 前打印此说明。
 - 如果 PSK 留空，使用 `openssl` 自动生成随机 PSK。
 - 如果端口留空，在 `10000–60000` 范围内随机选择一个未占用端口。
